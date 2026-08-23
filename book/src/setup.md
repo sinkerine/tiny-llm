@@ -1,10 +1,19 @@
 # Setting Up the Environment
 
-To follow this course, you need a Mac with Apple silicon. The project uses PDM for dependency and environment management.
+This checkout uses Nix flakes and direnv to provide a reproducible development
+shell on NixOS. The target accelerator is an NVIDIA GPU with CUDA, not Apple
+silicon. The project uses PDM for Python dependency management inside the Nix
+shell.
 
-## Install PDM
+Before starting, configure the NVIDIA driver in NixOS and verify it with:
 
-Follow the [official installation guide](https://pdm-project.org/en/latest/) to install PDM.
+```bash
+nvidia-smi
+```
+
+Your NixOS configuration should enable flakes and direnv. A typical setup
+includes `programs.direnv.enable = true;` and
+`programs.direnv.nix-direnv.enable = true;`.
 
 ## Clone the Repository
 
@@ -28,19 +37,25 @@ Reference implementations are available if you get stuck during the course.
 
 ```bash
 cd tiny-llm
-# This creates a virtual environment and installs all dependencies.
+# Allow direnv to load flake.nix. This enters the CUDA development shell.
+direnv allow
+# This creates .venv and installs all Python dependencies.
 pdm install -v
+# Activate the newly-created .venv in the direnv shell.
+direnv reload
 ```
 
 ## Check the Installation
 
 ```bash
 pdm run check-installation
-# The reference solution should pass all Week 1 tests.
-pdm run test-refsol -- -- -k week_1
 ```
 
-## Run Unit Tests
+This command runs a small PyTorch CUDA matmul smoke check. Course tests and
+model-loading instructions still target the legacy MLX/Metal code; defer them
+until the CUDA rewrite is complete.
+
+## Run Unit Tests (after CUDA rewrite)
 
 Your code is in `src/tiny_llm`. You can run the unit tests with:
 
@@ -48,10 +63,15 @@ Your code is in `src/tiny_llm`. You can run the unit tests with:
 pdm run test
 ```
 
-## Download the Model Parameters
+## Download the Model Parameters (legacy, deferred)
 
-We use the official 4-bit Qwen3 MLX model files. The default model is `Qwen/Qwen3-0.6B-MLX-4bit`, which is small enough
-for the dequantized Python implementation in Week 1. If your device has more memory, you can also try larger Qwen3 models.
+The original course uses official 4-bit Qwen3 MLX model files. These files and
+commands belong to the legacy MLX implementation; skip this section while the
+CUDA model loader is being rewritten. No MLX package is installed by this
+environment.
+
+The legacy default model is `Qwen/Qwen3-0.6B-MLX-4bit`, which is small enough
+for the original dequantized Python implementation in Week 1.
 
 Follow the [Hugging Face CLI guide](https://huggingface.co/docs/huggingface_hub/main/en/guides/cli) to install the `hf`
 command-line tool.
@@ -66,7 +86,7 @@ hf download Qwen/Qwen3-1.7B-MLX-4bit
 hf download Qwen/Qwen3-4B-MLX-4bit
 ```
 
-Then, you can run:
+Legacy path only (not currently supported by the CUDA environment):
 
 ```bash
 pdm run main --solution ref --loader week1
@@ -74,6 +94,8 @@ pdm run main --solution ref --loader week1
 
 The command should load the reference model and print generated text.
 
-In Week 2, we will write C++ and Metal kernels. The required additional tools are covered at the end of Week 1.
+The Nix shell supplies CUDA 13.0, CMake, Ninja, and the compiler toolchain.
+The checked-in Python and custom-extension implementations still target MLX
+and Metal; their CUDA rewrites are pending.
 
 {{#include copyright.md}}

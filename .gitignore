@@ -120,6 +120,9 @@ ipython_config.py
 # Local coding-agent session transcripts (may contain source and tool output)
 .tiny-llm/
 
+# direnv state
+.direnv/
+
 # PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
 __pypackages__/
 
@@ -132,6 +135,7 @@ celerybeat.pid
 
 # Environments
 .env
+!.envrc
 .venv
 env/
 venv/

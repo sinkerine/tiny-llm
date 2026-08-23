@@ -14,13 +14,15 @@ small enough to read end to end makes it possible to connect the equations to
 memory traffic, kernel occupancy, KV-cache growth, batching, and request
 scheduling.
 
-The course is built on MLX arrays and the MLX extension runtime, without using
-high-level neural-network layers. When a chapter teaches an operator, your
-solution implements that operator in Python, C++, or Metal rather than calling
-the corresponding optimized MLX operation. MLX remains the correctness oracle
-and performance baseline.
+The upstream course uses MLX arrays and Metal extensions. This checkout is
+being rewritten for PyTorch, CUDA, and native CUDA kernels. The checked-in
+course implementation still contains the old MLX/Metal path; it is not the
+active CUDA implementation and will be replaced during the port.
 
 ## The Learning Path
+
+The following learning path is inherited from upstream. Chapters still
+describing MLX/Metal are legacy material until their CUDA rewrites land.
 
 The course follows a four-week learning path:
 
@@ -45,11 +47,12 @@ The course follows a four-week learning path:
   and one explicit evidence-backed selection, followed by bounded,
   range-retrievable evidence for oversized tool results.
 
-## Why MLX and Qwen3?
+## Why CUDA and Qwen3?
 
-Apple silicon provides a practical local environment with one shared memory
-space and direct access to Metal kernels. Students can inspect the complete
-path on one machine instead of depending on an expensive CUDA GPU setup.
+This checkout targets an NVIDIA CUDA machine, not Apple silicon. The
+reproducible NixOS shell pins Python 3.12, PDM, CUDA 13.0, and native build
+tools. Configure the NVIDIA driver in NixOS so `/run/opengl-driver/lib` and
+`nvidia-smi` are available.
 
 Qwen3-4B is large enough to expose real weight-bandwidth, attention, and cache
 costs, but small enough to iterate on locally. Its grouped-query attention,
@@ -64,10 +67,16 @@ The book is published at
 existing checkout with:
 
 ```bash
+# Requires Nix flakes and direnv. `direnv allow` loads flake.nix.
+direnv allow
 pdm install -v
+direnv reload
 pdm run check-installation
-pdm run test-refsol -- -- -k week_1
 ```
+
+`check-installation` runs a small PyTorch CUDA matmul smoke check. Course tests
+and model-loading chapters still target the legacy MLX/Metal code and remain
+deferred until their CUDA rewrites land.
 
 The `tiny_llm` package is where students implement the exercises.
 `tiny_llm_ref` contains the reference solution used by the tests and benchmark

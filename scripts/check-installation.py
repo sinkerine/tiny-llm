@@ -1,20 +1,23 @@
-import mlx.core as mx
 import torch
 
-with mx.stream(mx.cpu):
-    a = mx.array([1, 2, 3])
-    b = mx.array([4, 5, 6])
-    c = mx.add(a, b)
-    print(c)
 
-with mx.stream(mx.gpu):
-    a = mx.array([1, 2, 3])
-    b = mx.array([4, 5, 6])
-    c = mx.add(a, b)
-    print(c)
+def main() -> None:
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is unavailable to PyTorch")
 
-print(
-    torch.add(
-        torch.tensor([1, 2, 3], device="cpu"), torch.tensor([4, 5, 6], device="cpu")
-    )
-)
+    device = torch.device("cuda")
+    left = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device=device)
+    right = torch.tensor([[5.0, 6.0], [7.0, 8.0]], device=device)
+    result = left @ right
+    torch.cuda.synchronize()
+
+    expected = torch.tensor([[19.0, 22.0], [43.0, 50.0]], device=device)
+    if not torch.equal(result, expected):
+        raise SystemExit(f"CUDA matmul returned {result}")
+
+    print(f"CUDA device: {torch.cuda.get_device_name(device)}")
+    print(f"CUDA matmul: {result.cpu().tolist()}")
+
+
+if __name__ == "__main__":
+    main()
