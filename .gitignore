@@ -130,6 +130,10 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# Nix / direnv
+.direnv/
+result
+
 # Environments
 .env
 .venv

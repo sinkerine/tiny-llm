@@ -1,5 +1,7 @@
 # Week 1 Day 2: Positional Encodings and RoPE
 
+> This branch uses PyTorch/CUDA for Week 1. See [the CUDA setup guide](https://github.com/sinkerine/tiny-llm/blob/week1/CUDA.md) for tensor API changes, environment setup, and tests. Student tasks remain unfinished. Historical MLX links below are supplemental references.
+
 The Day 2 starter already declares `RoPE(dims, seq_len, base=10000, traditional=False)`. Its constructor and call method
 are empty. You will fill in those two methods: cache one table of position-dependent angles, then use it to rotate the
 last dimension of an input shaped `(N, L, H, D)`. Day 3 will apply the non-traditional form to Qwen3's query and key
@@ -26,9 +28,9 @@ angular_rate[i] = base ** (-i / (D // 2))
 angle[position, i] = position * angular_rate[i]
 ```
 
-Use `mlx.core` operations such as `arange`, `power`, `outer`, `cos`, and `sin` to precompute the cosine and sine of those
+Use `torch` operations such as `arange`, `power`, `outer`, `cos`, and `sin` to precompute the cosine and sine of those
 angles for every position from `0` through `seq_len - 1`. The two tables have shape `(seq_len, M)`. Implement the
-operator yourself with these array operations; `mx.fast.rope` is the supplied test's correctness oracle, not the
+operator yourself with these array operations; complex-number rotation is the supplied test's correctness oracle, not the
 implementation for this exercise. For this lesson, assume that `D` is even, so `M` pairs cover the whole head
 dimension.
 

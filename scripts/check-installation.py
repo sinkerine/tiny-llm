@@ -1,20 +1,15 @@
-import mlx.core as mx
 import torch
+import transformers
 
-with mx.stream(mx.cpu):
-    a = mx.array([1, 2, 3])
-    b = mx.array([4, 5, 6])
-    c = mx.add(a, b)
-    print(c)
-
-with mx.stream(mx.gpu):
-    a = mx.array([1, 2, 3])
-    b = mx.array([4, 5, 6])
-    c = mx.add(a, b)
-    print(c)
-
-print(
-    torch.add(
-        torch.tensor([1, 2, 3], device="cpu"), torch.tensor([4, 5, 6], device="cpu")
+print(f"PyTorch: {torch.__version__}; Transformers: {transformers.__version__}")
+if not torch.cuda.is_available():
+    raise SystemExit(
+        "CUDA unavailable. Check the NVIDIA driver and CUDA-enabled PyTorch installation."
     )
+x = torch.randn(32, 32, device="cuda")
+y = x @ x.T
+torch.cuda.synchronize()
+assert torch.isfinite(y).all()
+print(
+    f"CUDA {torch.version.cuda}: {torch.cuda.get_device_name(0)} — matrix multiplication passed"
 )

@@ -1,5 +1,10 @@
 # tiny-llm
 
+This branch ports **Week 1 to PyTorch/CUDA on Linux** and preserves student
+exercise stubs. See [CUDA setup, tests, direnv, and Neovim completion](CUDA.md)
+for the local workflow. Weeks 2–4 and the upstream description below still
+target MLX/Metal.
+
 [![CI (main)](https://github.com/skyzh/tiny-llm/actions/workflows/main.yml/badge.svg)](https://github.com/skyzh/tiny-llm/actions/workflows/main.yml)
 
 tiny-llm is a hands-on course for systems engineers who want to understand LLM

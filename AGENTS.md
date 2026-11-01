@@ -12,18 +12,21 @@
 
 ## Environment Requirements
 
-- macOS on Apple Silicon is expected by the project.
-- Install dependencies first:
+- This branch targets Linux/CUDA for Week 1; see `CUDA.md`.
+- Keep all student exercises unfinished. Port existing reference solutions only.
+- Enter `nix develop` (or use direnv), then install dependencies:
 
 ```bash
-pdm install -v
+uv sync --locked
 pdm run check-installation
 ```
+
+- Weeks 2–4 retain MLX/Metal and are outside the CUDA test scope.
 
 - Optional baseline check from the setup chapter (reference solution, Week 1):
 
 ```bash
-pdm run test-refsol -- -- -k week_1
+python -m pytest tests_refsol/test_week_1_day_*.py -q
 ```
 
 ## Agent Test Workflow

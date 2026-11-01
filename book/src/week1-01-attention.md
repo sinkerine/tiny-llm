@@ -1,6 +1,8 @@
 # Week 1 Day 1: Attention and Multi-Head Attention
 
-The starter provides `softmax` through MLX so that Day 1 can focus on the attention data flow. Your required work is to
+> This branch uses PyTorch/CUDA for Week 1. See [the CUDA setup guide](https://github.com/sinkerine/tiny-llm/blob/week1/CUDA.md) for tensor API changes, environment setup, and tests. Student tasks remain unfinished. Historical MLX links below are supplemental references.
+
+The starter provides `softmax` through PyTorch so that Day 1 can focus on the attention data flow. Your required work is to
 complete `scaled_dot_product_attention_simple` and `SimpleMultiHeadAttention` in `src/tiny_llm/attention.py`, plus the
 `linear` helper in `src/tiny_llm/basics.py`. Other attention functions in the starter are for later days and are not part
 of this chapter.
@@ -82,7 +84,7 @@ output: N.. x L x D
 scale = 1/sqrt(D) if not specified
 ```
 
-Use the supplied `softmax` helper for the required exercise. As an optional, ungraded bonus, replace its MLX call with
+Use the supplied `softmax` helper for the required exercise. As an optional, ungraded bonus, replace its PyTorch call with
 your own numerically stable implementation: subtract the maximum value along `axis`, exponentiate the shifted values,
 then divide by their sum along the same axis. Preserve the helper's public API and output behavior.
 

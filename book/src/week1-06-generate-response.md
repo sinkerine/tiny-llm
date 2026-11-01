@@ -1,5 +1,7 @@
 # Week 1 Day 6: Generating the Response: Prefill and Decode
 
+> This branch uses PyTorch/CUDA for Week 1. See [the CUDA setup guide](https://github.com/sinkerine/tiny-llm/blob/week1/CUDA.md) for tensor API changes, environment setup, and tests. Student tasks remain unfinished. Historical MLX links below are supplemental references.
+
 On Day 6, we will implement response generation for an LLM chatbot. The implementation is short, but it exercises much
 of the code from the previous days. Use this chapter to integrate and debug the complete Week 1 model.
 
@@ -31,7 +33,7 @@ logits = output_logits[:, -1, :]
 
 You may normalize these logits into log probabilities with the log-sum-exp trick. This normalization does not change
 the result of `argmax`, but the sampler introduced on Day 7 expects log probabilities. If `sampler` is `None`, use
-`mx.argmax` along the final, vocabulary dimension. Otherwise, pass the `(1, vocab_size)` log-probability array to
+`torch.argmax` along the final, vocabulary dimension. Otherwise, pass the `(1, vocab_size)` log-probability array to
 `sampler`, which returns one token ID in an integer array with shape `(1,)`. Selecting the highest-scoring token at every
 step is called greedy decoding.
 
@@ -48,13 +50,9 @@ Generate tokens in a loop until the model emits `tokenizer.eos_token_id` or `max
 Append each new token to the token array so that the next model call receives the complete sequence. An EOS token already
 inside the prompt is context and does not stop generation; only a newly generated EOS does.
 
-Before the loop, bind one streaming detokenizer with `detokenizer = tokenizer.detokenizer`, then call
-`detokenizer.reset()` once. Keep and reuse that same stateful object throughout generation: feed every non-EOS output
-token to `detokenizer.add_token(...)` and print each `detokenizer.last_segment` as it becomes available. With the locked
-mlx-lm 0.31.3 dependency, each separate access to the `tokenizer.detokenizer` property creates a fresh streaming
-detokenizer, so repeatedly accessing the property would discard the buffered text. On either termination path, call
-`detokenizer.finalize()` on the saved object and print its final `last_segment` so buffered text is not lost. The
-function returns `None` after streaming the response.
+Use one `transformers.TextStreamer` with the Hugging Face tokenizer for the entire response.
+Feed each non-EOS generated token to the streamer on CPU, and end the stream on either termination path
+so buffered text is flushed. The function returns `None` after streaming the response.
 
 An example of the sequences provided to the `_step` function is as below:
 
@@ -78,7 +76,7 @@ pdm run test --week 1 --day 6
 Then complete the required product check with the default 0.6B model:
 
 ```bash
-hf download Qwen/Qwen3-0.6B-MLX-4bit
+hf download Qwen/Qwen3-0.6B
 pdm run main --solution tiny_llm --loader week1 --model qwen3-0.6b \
   --prompt "Give me a short introduction to large language model"
 ```

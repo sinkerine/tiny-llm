@@ -1,28 +1,9 @@
-from model_names import shortcut_name_to_full_name
-
 from .qwen3_week1 import Qwen3ModelWeek1
-from .qwen3_week2 import Qwen3ModelWeek2
-from .qwen3_week3 import Qwen3ModelWeek3
 
 
-def dispatch_model(model_name: str, mlx_model, week: int, **kwargs):
-    model_name = shortcut_name_to_full_name(model_name)
-    is_qwen3 = model_name.startswith("Qwen/Qwen3")
-    if week == 1 and is_qwen3:
-        return Qwen3ModelWeek1(mlx_model, **kwargs)
-    elif week == 2 and is_qwen3:
-        return Qwen3ModelWeek2(mlx_model, **kwargs)
-    elif week == 3 and is_qwen3:
-        return Qwen3ModelWeek3(mlx_model, **kwargs)
-    else:
-        raise ValueError(f"{model_name} for week {week} not supported")
-
-
-def dispatch_week3_batch_model(model_name: str, mlx_model):
-    """Build the dense-cache Week 3 scheduler model with MLX projections."""
-    return dispatch_model(
-        model_name,
-        mlx_model,
-        week=2,
-        use_mlx_quantized_linear=True,
-    )
+def dispatch_model(model_name: str, hf_model, week: int, **kwargs):
+    if week != 1:
+        raise ValueError("The CUDA runtime currently supports Week 1 only")
+    if hf_model.config.model_type != "qwen3":
+        raise ValueError(f"Unsupported model: {model_name}")
+    return Qwen3ModelWeek1(hf_model, **kwargs)

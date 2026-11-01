@@ -1,15 +1,17 @@
 # Week 1 Day 5: The Qwen3 Model
 
+> This branch uses PyTorch/CUDA for Week 1. See [the CUDA setup guide](https://github.com/sinkerine/tiny-llm/blob/week1/CUDA.md) for tensor API changes, environment setup, and tests. Student tasks remain unfinished. Historical MLX links below are supplemental references.
+
 On Day 5, we will combine the components from the previous chapters into the complete Qwen3 model.
 
 Model-level tests require the corresponding model files. Start with the default 0.6B model; download the larger models
 only if you want to test them as well:
 
 ```bash
-hf download Qwen/Qwen3-0.6B-MLX-4bit
+hf download Qwen/Qwen3-0.6B
 # Optional larger models:
-hf download Qwen/Qwen3-1.7B-MLX-4bit
-hf download Qwen/Qwen3-4B-MLX-4bit
+hf download Qwen/Qwen3-1.7B
+hf download Qwen/Qwen3-4B
 ```
 
 The deterministic checkpoint tests do not need downloaded model files. The default 0.6B model is required for the final
@@ -109,8 +111,8 @@ Now that we have built all the Qwen3 components, we can implement `Qwen3ModelWee
 src/tiny_llm/qwen3_week1.py
 ```
 
-You will not implement the process of reading model parameters from tensor files. Instead, load the model with `mlx_lm`,
-then transfer its parameters into our implementation. The `Qwen3ModelWeek1` constructor therefore accepts an MLX model.
+You will not implement the process of reading model parameters from tensor files. Instead, load the model with `transformers.AutoModelForCausalLM.from_pretrained`,
+then transfer its parameters into our implementation. The `Qwen3ModelWeek1` constructor therefore accepts a Hugging Face PyTorch model.
 
 The Qwen3 model has the following layers:
 
@@ -132,30 +134,29 @@ Embedding.as_linear OR linear (lm_head)
 output
 ```
 
-Read the number of layers, hidden size, head dimension, and other configuration values from `mlx_model.args`, whose type
-is defined by [`ModelArgs`](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen3.py). The loaded weights
-are available through `mlx_model.model`; use the Qwen3 implementation and model metadata to identify the corresponding
+Read the number of layers, hidden size, head dimension, and other configuration values from `hf_model.config`, whose type
+is defined by `transformers.Qwen3Config`. The loaded weights
+are available through `hf_model.model`; use the Qwen3 implementation and model metadata to identify the corresponding
 layer names.
 
 Instantiate every configured Transformer block in model order, run all of them, and apply the final RMSNorm before the
 vocabulary projection. `head_dim`, the query and key/value head counts, intermediate size, RMS epsilon, maximum positions,
 and RoPE theta are separate configuration fields; map each one directly.
 
-By this point, you have implemented `RMSNorm`. Replace the temporary Day 3 calls to `mx.fast.rms_norm` with
+By this point, you have implemented `RMSNorm`. Replace the temporary Day 3 calls to `torch.nn.functional.rms_norm` with
 `RMSNorm(head_dim, q_norm, eps=...)` and `RMSNorm(head_dim, k_norm, eps=...)`. They implement the same formula; the built-in
 calls existed only to keep the GQA chapter focused on attention.
 
 Different Qwen3 model variants map hidden vectors back to vocabulary logits in different ways. Some tie the input and
 output embeddings and use `Embedding.as_linear`; others have a separate `lm_head` linear layer. Select the strategy with
-`mlx_model.args.tie_word_embeddings`: if it is `True`, use `Embedding.as_linear`; otherwise, load and use `lm_head`.
+`hf_model.config.tie_word_embeddings`: if it is `True`, use `Embedding.as_linear`; otherwise, load and use `lm_head`.
 
 The model takes a sequence of token IDs and returns unnormalized logits for every sequence position. On Day 6, we will
 use the final position's logits to select the next token and generate a response.
 
-The MLX models used in this course have quantized weights. Dequantize each
-linear or embedding layer before loading it into tiny-llm by using the provided
-`quantize.dequantize_linear` function, then store the readable Week 1 weight as
-BF16. Model activations and layer outputs should remain BF16. A readable
+The CUDA checkpoints use original Hugging Face weights. Read each linear or
+embedding module's `.weight` tensor directly; no dequantization is required.
+Load the model in BF16 and move it to CUDA before transferring weights. Model activations and layer outputs should remain BF16. A readable
 attention or normalization expression may compute in FP32 for stability, but it
 must cast its model-facing result back to BF16.
 
@@ -166,7 +167,7 @@ Run the tests for this task with:
 
 ```bash
 # The required 0.6B integration check exercises Task 3; download it if it is not already cached.
-hf download Qwen/Qwen3-0.6B-MLX-4bit
+hf download Qwen/Qwen3-0.6B
 pdm run test --week 1 --day 5 -- -k task_3
 ```
 

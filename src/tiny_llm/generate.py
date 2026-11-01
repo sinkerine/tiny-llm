@@ -1,7 +1,6 @@
-import mlx.core as mx
-from mlx_lm.tokenizer_utils import TokenizerWrapper
+import torch
+from transformers import PreTrainedTokenizerBase
 from .qwen3_week1 import Qwen3ModelWeek1
-from .qwen3_week2 import Qwen3ModelWeek2
 from typing import Callable
 
 
@@ -14,33 +13,10 @@ def _release_kv_cache(kv_cache):
 
 def simple_generate(
     model: Qwen3ModelWeek1,
-    tokenizer: TokenizerWrapper,
+    tokenizer: PreTrainedTokenizerBase,
     prompt: str,
-    sampler: Callable[[mx.array], mx.array] | None,
+    sampler: Callable[[torch.Tensor], torch.Tensor] | None,
     max_tokens: int = 256,
 ) -> None:
     def _step(model, y):
         pass
-
-
-def simple_generate_with_kv_cache(
-    model: Qwen3ModelWeek2,
-    tokenizer: TokenizerWrapper,
-    prompt: str,
-    max_tokens: int = 256,
-    use_bounded_kv_capacity: bool | None = None,
-) -> str:
-    def _step(model, y, offset, kv_cache):
-        pass
-
-
-def speculative_generate(
-    draft_model: Qwen3ModelWeek2,
-    model: Qwen3ModelWeek2,
-    draft_tokenizer: TokenizerWrapper,
-    tokenizer: TokenizerWrapper,
-    prompt: str,
-    proposal_length: int = 4,
-    max_tokens: int = 256,
-) -> str:
-    pass

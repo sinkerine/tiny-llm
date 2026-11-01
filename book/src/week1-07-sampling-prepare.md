@@ -1,5 +1,7 @@
 # Week 1 Day 7: Sampling and Preparing for Week 2
 
+> This branch uses PyTorch/CUDA for Week 1. See [the CUDA setup guide](https://github.com/sinkerine/tiny-llm/blob/week1/CUDA.md) for tensor API changes, environment setup, and tests. Student tasks remain unfinished. Historical MLX links below are supplemental references.
+
 The Week 1 model can now produce normalized log probabilities and generate a
 greedy response. Today you will complete its single-request sampling path, run
 that path in the full Qwen3 loop, and prepare the tools needed for Week 2's
@@ -20,7 +22,7 @@ For one active request, the sampler receives normalized log probabilities with
 shape `(1, vocab_size)` and returns one token-ID array with shape `(1,)` and
 dtype `uint32`. The product does not pass multiple rows to this sampler.
 
-When filtering, first copy the input. MLX indexed assignment mutates the array
+When filtering, first copy the input. PyTorch indexed assignment mutates the tensor
 object, so masking the caller's array directly would corrupt the log
 probabilities that the generation loop supplied.
 
@@ -30,14 +32,14 @@ When `temp=0`, use greedy decoding. When `temp` is greater than 0, sample the ne
 A higher temperature flattens the distribution, making lower-probability tokens more likely and increasing output variety.
 
 To implement temperature sampling, divide the log probabilities by the
-temperature and pass them to `mx.random.categorical` with `axis=-1`.
+temperature and pass them to `torch.multinomial` after converting the scaled logits to probabilities.
 
 ### Top-k Sampling
 
 Top-k sampling keeps only the `k` tokens with the highest log probabilities.
 Apply this filter before top-p and temperature scaling.
 
-Use `mx.argpartition` to find the indices outside the top `k`, mask their log probabilities with `-mx.inf`, then apply
+Use `torch.topk` to identify the retained top `k` indices, mask their log probabilities with `-torch.inf`, then apply
 temperature sampling.
 
 ### Top-p (Nucleus) Sampling
@@ -45,10 +47,10 @@ temperature sampling.
 Top-p sampling keeps the smallest high-probability set of tokens whose cumulative probability reaches or exceeds `p`.
 Apply this filter before temperature scaling.
 
-One implementation uses `mx.argsort` to order the log probabilities from highest to lowest, applies `exp` to recover
+One implementation uses `torch.argsort` to order the log probabilities from highest to lowest, applies `exp` to recover
 probabilities, and applies `cumsum` to compute cumulative probability. Keep a token when the cumulative probability before
 it is less than `p`; this includes the token that crosses the threshold. Mask the remaining log probabilities with
-`-mx.inf`.
+`-torch.inf`.
 
 The complete non-greedy order is:
 
@@ -56,7 +58,7 @@ The complete non-greedy order is:
 2. apply top-k;
 3. apply top-p, retaining the threshold-crossing token;
 4. divide by temperature; and
-5. draw with `mx.random.categorical(..., axis=-1)`.
+5. draw with `torch.multinomial` from the final softmax probabilities.
 
 `None` or a non-positive value disables its corresponding filter.
 `top_k == vocab_size` and `top_p == 1` leave the vocabulary unfiltered. The
@@ -88,7 +90,7 @@ These commands require the cached 0.6B model. If it is missing, download it and
 rerun them:
 
 ```bash
-hf download Qwen/Qwen3-0.6B-MLX-4bit
+hf download Qwen/Qwen3-0.6B
 ```
 
 Larger models remain optional and are not a Day 7 completion gate.

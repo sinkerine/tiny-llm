@@ -1,5 +1,7 @@
 # Week 1 Day 3: Grouped Query Attention (GQA)
 
+> This branch uses PyTorch/CUDA for Week 1. See [the CUDA setup guide](https://github.com/sinkerine/tiny-llm/blob/week1/CUDA.md) for tensor API changes, environment setup, and tests. Student tasks remain unfinished. Historical MLX links below are supplemental references.
+
 On Day 3, we will implement grouped-query attention (GQA). Qwen3 uses GQA to reduce the computational and memory costs
 of the key (K) and value (V) projections. In multi-head attention (MHA), every query (Q) head has a corresponding K and
 V head. With GQA, groups of Q heads share K and V heads. Multi-query attention (MQA) is the special case in which every
@@ -129,7 +131,7 @@ x = linear(x, wo) -> B, L, E
 
 Qwen3 attention has no Q/K/V projection biases. Apply RMSNorm to each Q and K head before applying non-traditional RoPE;
 the order matters when the normalization weights are nonuniform. We will implement the reusable `RMSNorm` layer on Day 4,
-so call `mx.fast.rms_norm` directly for `q_norm` and `k_norm` today.
+so call `torch.nn.functional.rms_norm` directly for `q_norm` and `k_norm` today.
 
 The grouped attention arithmetic must run in float32: cast the projected, normalized, and rotated Q and K tensors and the
 projected V tensor to float32 before calling `scaled_dot_product_attention_grouped`. Cast its result back to the input

@@ -1,147 +1,75 @@
-from __future__ import annotations
-
-import mlx.core as mx
-import numpy as np
 import pytest
-from mlx_lm.tokenizer_utils import TokenizerWrapper
-
+import torch
 from .tiny_llm_base import simple_generate
-
-
-EOS = 0
-VOCAB_SIZE = 8
-
-
-class FakeDetokenizer:
-    def __init__(self, tokenizer=None):
-        self.last_segment = ""
-        self.pending = "stale"
-
-    def reset(self):
-        self.last_segment = ""
-        self.pending = ""
-
-    def add_token(self, token: int):
-        self.last_segment = self.pending
-        self.pending = {EOS: "<eos>", 2: "A", 3: "B", 4: "C"}.get(token, "?")
-
-    def finalize(self):
-        self.last_segment = self.pending
-        self.pending = ""
+from .week1_utils import DEVICES
 
 
 class FakeTokenizer:
-    def __init__(self, prompt_tokens: list[int]):
-        self.prompt_tokens = prompt_tokens
-        self.eos_token_id = EOS
+    eos_token_id = 0
 
-    @property
-    def detokenizer(self):
-        return FakeDetokenizer()
+    def encode(self, prompt, add_special_tokens=False):
+        assert not add_special_tokens
+        return [7, 0] if prompt else []
 
-    def encode(self, prompt: str, add_special_tokens: bool = True) -> list[int]:
-        if add_special_tokens:
-            return [6, *self.prompt_tokens]
-        return list(self.prompt_tokens)
-
-
-class MinimalTokenizer(FakeTokenizer):
-    chat_template = None
-
-    def get_vocab(self) -> dict[str, int]:
-        return {}
+    def decode(self, tokens, **kwargs):
+        return "".join({2: "A", 3: "B", 4: "C"}.get(int(t), "") for t in tokens)
 
 
 class ScriptedModel:
-    def __init__(self, next_tokens: list[int], decoy_token: int = 6):
-        self.next_tokens = list(next_tokens)
-        self.decoy_token = decoy_token
+    def __init__(self, tokens, device):
+        self.tokens = iter(tokens)
+        self.device = device
+        self.inputs = []
 
-    def __call__(self, tokens: mx.array) -> mx.array:
-        if not self.next_tokens:
-            raise AssertionError("model received an unexpected call")
-        next_token = self.next_tokens.pop(0)
-        token_ids = np.array(tokens).reshape(-1).tolist()
-        if token_ids == [7] or 6 in token_ids:
-            next_token = 4
-        logits = np.full((1, tokens.shape[1], VOCAB_SIZE), -10_000.0)
-        logits[:, :-1, self.decoy_token] = 10_000.0
-        logits[:, -1, next_token] = 10_000.0
-        return mx.array(logits, dtype=mx.float32)
+    def __call__(self, tokens):
+        self.inputs.append(tokens.clone())
+        logits = torch.full((*tokens.shape, 8), -10000.0, device=self.device)
+        logits[:, -1, next(self.tokens)] = 10000.0
+        return logits
 
 
-def test_task_1_greedy_prefill_decode_eos_and_stream_tail(capsys):
-    tokenizer = FakeTokenizer([7, EOS])
-    model = ScriptedModel([2, 3, EOS])
-
-    result = simple_generate(model, tokenizer, "prompt", sampler=None)
-
-    assert result is None
-    assert capsys.readouterr().out == "AB"
-
-
-def test_task_1_custom_sampler_receives_stable_log_probabilities(capsys):
-    tokenizer = FakeTokenizer([5])
-    model = ScriptedModel([2, EOS])
-    sampler_inputs: list[mx.array] = []
-    sampled_tokens = iter([4, EOS])
-
-    def sampler(logprobs: mx.array) -> mx.array:
-        sampler_inputs.append(logprobs)
-        return mx.array([next(sampled_tokens)], dtype=mx.int32)
-
-    simple_generate(model, tokenizer, "prompt", sampler=sampler)
-
-    assert sampler_inputs
-    for logprobs in sampler_inputs:
-        values = np.array(logprobs)
-        assert values.shape == (1, VOCAB_SIZE)
-        assert np.isfinite(values).all()
-        np.testing.assert_allclose(np.exp(values).sum(axis=-1), [1.0], atol=1e-6)
-    assert capsys.readouterr().out == "C"
+@pytest.mark.parametrize("device", DEVICES)
+def test_task_1_greedy_prefill_decode_and_eos(device, capsys):
+    model = ScriptedModel([2, 3, 0], device)
+    assert simple_generate(model, FakeTokenizer(), "prompt", None) is None
+    assert capsys.readouterr().out.strip() == "AB"
+    assert model.inputs[0].tolist() == [[7, 0]]
+    assert model.inputs[-1].tolist() == [[7, 0, 2, 3]]
 
 
-def test_task_1_max_tokens_bounds_non_eos_generation(capsys):
-    tokenizer = FakeTokenizer([5])
-    model = ScriptedModel([2, 2, 2, 2])
+@pytest.mark.parametrize("device", DEVICES)
+def test_task_1_sampler_and_bound(device, capsys):
+    model = ScriptedModel([2] * 4, device)
 
-    simple_generate(model, tokenizer, "prompt", sampler=None, max_tokens=3)
+    def sampler(logprobs):
+        assert torch.isfinite(logprobs).all()
+        torch.testing.assert_close(logprobs.exp().sum(-1), torch.ones(1, device=device))
+        return torch.tensor([4], device=device)
 
-    assert capsys.readouterr().out == "AAA"
-
-
-def test_task_1_caller_can_lower_max_tokens(capsys):
-    tokenizer = FakeTokenizer([5])
-    model = ScriptedModel([2, 2])
-
-    simple_generate(model, tokenizer, "prompt", sampler=None, max_tokens=1)
-
-    assert capsys.readouterr().out == "A"
+    simple_generate(model, FakeTokenizer(), "prompt", sampler, max_tokens=3)
+    assert capsys.readouterr().out.strip() == "CCC"
+    assert len(model.inputs) == 3
 
 
-def test_task_1_default_max_tokens_is_256(capsys):
-    tokenizer = FakeTokenizer([5])
-    model = ScriptedModel([2] * 257)
-
-    simple_generate(model, tokenizer, "prompt", sampler=None)
-
-    assert capsys.readouterr().out == "A" * 256
+def test_task_1_default_bound(capsys):
+    model = ScriptedModel([2] * 257, "cpu")
+    simple_generate(model, FakeTokenizer(), "prompt", None)
+    assert len(model.inputs) == 256
+    assert capsys.readouterr().out.strip() == "A" * 256
 
 
-def test_task_1_real_tokenizer_wrapper_streams_nonempty_bounded_output(capsys):
-    tokenizer = TokenizerWrapper(
-        MinimalTokenizer([5]), detokenizer_class=FakeDetokenizer
+@pytest.mark.parametrize("limit", [-1, True, 1.5])
+def test_task_1_invalid_limit(limit):
+    with pytest.raises(ValueError):
+        simple_generate(
+            ScriptedModel([], "cpu"), FakeTokenizer(), "prompt", None, max_tokens=limit
+        )
+
+
+def test_task_1_zero_and_empty(capsys):
+    simple_generate(
+        ScriptedModel([], "cpu"), FakeTokenizer(), "prompt", None, max_tokens=0
     )
-    model = ScriptedModel([2, 2])
-
-    simple_generate(model, tokenizer, "prompt", sampler=None, max_tokens=1)
-
-    assert capsys.readouterr().out == "A"
-
-
-def test_task_1_rejects_empty_encoding():
-    tokenizer = FakeTokenizer([])
-    model = ScriptedModel([EOS])
-
-    with pytest.raises(Exception):
-        simple_generate(model, tokenizer, "prompt", sampler=None)
+    assert capsys.readouterr().out == ""
+    with pytest.raises(ValueError):
+        simple_generate(ScriptedModel([], "cpu"), FakeTokenizer(), "", None)
