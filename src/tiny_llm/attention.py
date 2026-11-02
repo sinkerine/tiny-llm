@@ -57,7 +57,13 @@ class SimpleMultiHeadAttention:
 
 
 def causal_mask(L: int, S: int, dtype: torch.dtype) -> torch.Tensor:
-    pass
+    if L > S:
+        raise ValueError("Causal attention requires S >= L")
+    q_tbl = torch.arange(L).unsqueeze(1)
+    k_tbl = torch.arange(S).unsqueeze(0)
+    limit_tbl = q_tbl + (S-L)
+    mask = k_tbl <= limit_tbl
+    return torch.where(mask, 0.0, -torch.inf).to(dtype)
 
 
 def scaled_dot_product_attention_grouped(
@@ -67,7 +73,26 @@ def scaled_dot_product_attention_grouped(
     scale: float | None = None,
     mask: torch.Tensor | str | None = None,
 ) -> torch.Tensor:
-    pass
+    batch_shape = query.shape[:-3]
+    H_q, L, D = query.shape[-3:]
+    H, S, _ = key.shape[-3:]
+
+    assert H_q % H == 0
+    n_repeats = H_q // H
+
+    q = query.reshape(*batch_shape, H, n_repeats, L, D)
+    k = key.unsqueeze(-3)
+    v = value.unsqueeze(-3)
+
+    if scale is None:
+        scale = 1 / D ** 0.5
+    qk = torch.einsum("...ld,...sd->...ls", q, k) * scale
+    if isinstance(mask, torch.Tensor):
+        qk += mask.reshape(*batch_shape, H, n_repeats, L, S)
+    elif isinstance(mask, str) and mask == "causal":
+        qk += causal_mask(L,S,query.dtype).to(device=query.device)
+    attention = softmax(qk, -1) @ v
+    return attention.reshape(*batch_shape, H_q, L, D)
 
 
 def paged_attention(
