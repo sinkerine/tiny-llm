@@ -1,19 +1,22 @@
-import mlx.core as mx
+import torch
 import math
 
 
-def softmax(x: mx.array, axis: int) -> mx.array:
-    # TODO: manual implementation
-    return mx.softmax(x, axis=axis)
+def softmax(x: torch.Tensor, axis: int) -> torch.Tensor:
+    # Supplied for Day 1; a manual implementation is an optional bonus exercise.
+    return torch.softmax(x, dim=axis)
 
 
 def linear(
-    x: mx.array,
-    w: mx.array,
-    bias: mx.array | None = None,
-) -> mx.array:
-    pass
+    x: torch.Tensor,
+    w: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    result = torch.einsum("...i,...oi->...o", x, w)
+    if bias is not None:
+        result += bias
+    return result
 
 
-def silu(x: mx.array) -> mx.array:
+def silu(x: torch.Tensor) -> torch.Tensor:
     pass

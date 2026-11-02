@@ -51,6 +51,32 @@ direnv reload
 pdm run check-installation
 ```
 
+## Build the Native Extensions Before Tests
+
+Week 1 test collection reaches the learner and reference native extensions
+through package imports, even though the Day 1 attention exercise is in
+Python. Before running either test command on a fresh checkout, prepare full
+Xcode, its Metal compiler, and CMake 3.27 or newer; the
+[toolchain steps in Week 1 Day 7](./week1-07-sampling-prepare.md#task-2-prepare-for-week-2)
+give the installation checks. Then, from the repository root, build both
+extensions:
+
+```bash
+pdm run build-ext
+pdm run build-ext-ref
+```
+
+The reference build supplies its native import; it does not implement the
+learner TODOs in `src/tiny_llm`.
+
+Check the completed Day 1 reference exercise before working on your starter:
+
+```bash
+pdm run test-refsol --week 1 --day 1 -- -k task_1
+# The reference solution should pass all Week 1 tests.
+pdm run test-refsol -- -- -k week_1
+```
+
 This command runs a small PyTorch CUDA matmul smoke check. Course tests and
 model-loading instructions still target the legacy MLX/Metal code; defer them
 until the CUDA rewrite is complete.

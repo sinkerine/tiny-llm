@@ -1,25 +1,23 @@
-import mlx.core as mx
-import copy
+import torch
 
 
 def make_sampler(temp: float, top_p: float | None, top_k: int | None):
-    def sample(logprobs: mx.array):
+    def sample(logprobs: torch.Tensor) -> torch.Tensor:
         if temp == 0:
-            return mx.argmax(logprobs, axis=-1)
-        logprobs = copy.copy(logprobs)  # TODO: do we really need a copy?
+            return logprobs.argmax(dim=-1)
+        scores = logprobs.clone()
         if top_k is not None and top_k > 0:
-            mask_elements = mx.argpartition(-logprobs, kth=top_k - 1, axis=-1)[
-                :, top_k:
-            ]
-            logprobs[:, mask_elements] = -mx.inf
-        if top_p is not None and top_p > 0:
-            sorted_idx = mx.argsort(-logprobs, axis=-1)
-            sorted_logprobs = logprobs[:, sorted_idx]
-            sorted_probs = mx.exp(sorted_logprobs)
-            cumsum = mx.cumsum(sorted_probs, axis=-1)
-            mask_elements = cumsum - sorted_probs < top_p
-            logprobs[:, sorted_idx] = mx.where(mask_elements, sorted_logprobs, -mx.inf)
-        logprobs = logprobs / temp
-        return mx.random.categorical(logprobs, axis=-1)
+            if top_k > scores.shape[-1]:
+                raise ValueError("top_k exceeds vocabulary size")
+            indices = scores.topk(top_k, dim=-1).indices
+            filtered = torch.full_like(scores, -torch.inf)
+            scores = filtered.scatter(-1, indices, scores.gather(-1, indices))
+        if top_p is not None and 0 < top_p < 1:
+            sorted_scores, indices = scores.sort(dim=-1, descending=True)
+            probabilities = sorted_scores.exp()
+            keep = probabilities.cumsum(dim=-1) - probabilities < top_p
+            sorted_scores = sorted_scores.masked_fill(~keep, -torch.inf)
+            scores = torch.empty_like(scores).scatter(-1, indices, sorted_scores)
+        return torch.multinomial(torch.softmax(scores / temp, dim=-1), 1).squeeze(-1)
 
     return sample

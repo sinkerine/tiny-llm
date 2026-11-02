@@ -1,4 +1,4 @@
-import mlx.core as mx
+import torch
 
 
 class RoPE:
@@ -13,19 +13,19 @@ class RoPE:
         self.dims = dims
         self.seq_len = seq_len
         half_dims = dims // 2
-        inner = mx.arange(0, half_dims, dtype=mx.float32) / half_dims
-        freqs = mx.power(base, -inner)
-        t = mx.arange(seq_len)
-        freqs = mx.outer(t, freqs)
-        self.cos_freqs = mx.cos(freqs)
-        self.sin_freqs = mx.sin(freqs)
+        inner = torch.arange(0, half_dims, dtype=torch.float32) / half_dims
+        freqs = base ** (-inner)
+        t = torch.arange(seq_len)
+        freqs = torch.outer(t, freqs)
+        self.cos_freqs = torch.cos(freqs)
+        self.sin_freqs = torch.sin(freqs)
         self.base = base
         self.half_dims = half_dims
         self.traditional = traditional
 
     def __call__(
-        self, x: mx.array, offset: list[slice] | slice | None = None
-    ) -> mx.array:
+        self, x: torch.Tensor, offset: list[slice] | slice | None = None
+    ) -> torch.Tensor:
         N, S, H, D = x.shape
         if offset is not None:
             if isinstance(offset, slice):
@@ -36,7 +36,9 @@ class RoPE:
                 )
                 for o in offset:
                     assert o.stop - o.start == S, f"offset must be of length {S}"
-                offset = mx.array([list(range(i.start, i.stop)) for i in offset])
+                offset = torch.tensor([list(range(i.start, i.stop)) for i in offset])
+        self.cos_freqs = self.cos_freqs.to(x.device)
+        self.sin_freqs = self.sin_freqs.to(x.device)
         cos_basis = (
             self.cos_freqs[:S, :] if offset is None else self.cos_freqs[offset, :]
         )
@@ -55,12 +57,12 @@ class RoPE:
         cos_basis = cos_basis.reshape(-1, S, 1, self.half_dims)
         sin_basis = sin_basis.reshape(-1, S, 1, self.half_dims)
         # manually doing complex number multiplication..
-        real = mx.multiply(x1, cos_basis) - mx.multiply(x2, sin_basis)
-        imag = mx.multiply(x2, cos_basis) + mx.multiply(x1, sin_basis)
+        real = torch.mul(x1, cos_basis) - torch.mul(x2, sin_basis)
+        imag = torch.mul(x2, cos_basis) + torch.mul(x1, sin_basis)
         if self.traditional:
-            y = mx.stack([real, imag], axis=-1)
+            y = torch.stack([real, imag], dim=-1)
             y = y.reshape(N, S, H, D)
         else:
-            y = mx.concat([real, imag], axis=-1)
+            y = torch.cat([real, imag], dim=-1)
             y = y.reshape(N, S, H, D)
-        return y.astype(x.dtype)
+        return y.to(x.dtype)

@@ -1,178 +1,66 @@
 import pytest
-from .utils import *
-from .tiny_llm_base import Qwen3ModelWeek1, Embedding, dequantize_linear, qwen3_week1
-from mlx_lm import load
+import torch
+from transformers import AutoModelForCausalLM
+from .tiny_llm_base import Qwen3ModelWeek1, Embedding, qwen3_week1
+from .week1_utils import DEVICES, DTYPES, assert_close, tiny_model, block_kwargs
 
 
-@pytest.mark.parametrize("stream", AVAILABLE_STREAMS, ids=AVAILABLE_STREAMS_IDS)
-@pytest.mark.parametrize("precision", PRECISIONS, ids=PRECISION_IDS)
-@pytest.mark.parametrize("mask", [None, "causal"], ids=["no_mask", "causal_mask"])
-def test_task_1_transformer_block(
-    stream: mx.Stream, precision: mx.Dtype, mask: str | None
-):
-    with mx.stream(stream):
-        from mlx_lm.models import qwen3
-
-        BATCH_SIZE = 1
-        SEQ_LEN = 10
-        NUM_ATTENTION_HEAD = 4
-        NUM_KV_HEADS = 2
-        HIDDEN_SIZE = 32
-        INTERMEDIATE_SIZE = HIDDEN_SIZE * 4
-
-        args = qwen3.ModelArgs(
-            model_type="qwen3",
-            hidden_size=HIDDEN_SIZE,
-            num_hidden_layers=1,
-            intermediate_size=INTERMEDIATE_SIZE,
-            num_attention_heads=NUM_ATTENTION_HEAD,
-            num_key_value_heads=NUM_KV_HEADS,
-            head_dim=HIDDEN_SIZE // NUM_ATTENTION_HEAD,
-            rms_norm_eps=1e-6,
-            vocab_size=1000,
-            max_position_embeddings=128,
-            rope_theta=10000,
-            tie_word_embeddings=True,
-        )
-
-        mlx_transformer_block = qwen3.TransformerBlock(args)
-
-        mlx_attention = mlx_transformer_block.self_attn
-        wq = mlx_attention.q_proj.weight
-        wk = mlx_attention.k_proj.weight
-        wv = mlx_attention.v_proj.weight
-        wo = mlx_attention.o_proj.weight
-        q_norm = mlx_attention.q_norm.weight
-        k_norm = mlx_attention.k_norm.weight
-
-        mlx_mlp = mlx_transformer_block.mlp
-        w_gate = mlx_mlp.gate_proj.weight
-        w_up = mlx_mlp.up_proj.weight
-        w_down = mlx_mlp.down_proj.weight
-
-        w_input_layernorm = mlx_transformer_block.input_layernorm.weight
-        w_post_attention_layernorm = (
-            mlx_transformer_block.post_attention_layernorm.weight
-        )
-
-        user_transformer_block = qwen3_week1.Qwen3TransformerBlock(
-            num_attention_heads=NUM_ATTENTION_HEAD,
-            num_kv_heads=NUM_KV_HEADS,
-            hidden_size=HIDDEN_SIZE,
-            head_dim=HIDDEN_SIZE // NUM_ATTENTION_HEAD,
-            intermediate_size=INTERMEDIATE_SIZE,
-            rms_norm_eps=1e-6,
-            wq=wq,
-            wk=wk,
-            wv=wv,
-            wo=wo,
-            q_norm=q_norm,
-            k_norm=k_norm,
-            w_gate=w_gate,
-            w_up=w_up,
-            w_down=w_down,
-            w_input_layernorm=w_input_layernorm,
-            w_post_attention_layernorm=w_post_attention_layernorm,
-        )
-
-        mx.random.seed(42)
-        x = mx.random.uniform(shape=(BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE), dtype=precision)
-
-        user_output = user_transformer_block(x, mask=mask)
-        mlx_output = mlx_transformer_block(x, mask=mask, cache=None)
-
-        assert_allclose(
-            user_output, mlx_output, precision=precision, rtol=1e-1, atol=1e-1
-        )
-
-
-@pytest.mark.skipif(
-    not qwen3_0_6b_model_exists(), reason="Qwen3-0.6B-4bit model not found"
-)
-def test_utils_qwen3_0_6b():
-    pass
-
-
-@pytest.mark.skipif(
-    not qwen3_4b_model_exists(), reason="Qwen3-4B-4bit model not found"
-)
-def test_utils_qwen3_4b():
-    pass
-
-
-@pytest.mark.skipif(
-    not qwen3_1_7b_model_exists(), reason="Qwen3-1.7B-4bit model not found"
-)
-def test_utils_qwen3_1_7b():
-    pass
-
-
-def helper_test_task_3(model_name: str, iters: int = 10):
-    mlx_model, tokenizer = load(model_name)
-    model = Qwen3ModelWeek1(mlx_model)
-    for iteration in range(iters):
-        input = (mx.arange(10, dtype=mx.int32) + iteration * 10).reshape(
-            1, 10
-        ) % tokenizer.vocab_size
-        user_output = model(input)
-        ref_output = mlx_model(input)
-        user_output = user_output - mx.logsumexp(user_output, axis=-1, keepdims=True)
-        ref_output = ref_output - mx.logsumexp(ref_output, axis=-1, keepdims=True)
-        assert_allclose(
-            user_output, ref_output, precision=mx.bfloat16, rtol=0.1, atol=2.5
-        )
-
-
-@pytest.mark.skipif(
-    not qwen3_0_6b_model_exists(), reason="Qwen3-0.6B-4bit model not found"
-)
-def test_task_2_embedding_call():
-    mlx_model, _ = load("Qwen/Qwen3-0.6B-MLX-4bit")
-    embedding = Embedding(
-        mlx_model.args.vocab_size,
-        mlx_model.args.hidden_size,
-        dequantize_linear(mlx_model.model.embed_tokens).astype(mx.bfloat16),
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@torch.inference_mode()
+def test_task_1_transformer_block(device, dtype):
+    model = tiny_model(device, dtype)
+    x = torch.randn(2, 5, 24, device=device, dtype=dtype)
+    positions = torch.arange(5, device=device)[None].expand(2, -1)
+    mask = torch.randn(2, 1, 5, 5, device=device, dtype=dtype)
+    expected = model.model.layers[0](
+        x, attention_mask=mask, position_embeddings=model.model.rotary_emb(x, positions)
     )
-    for _ in range(50):
-        input = mx.random.randint(low=0, high=mlx_model.args.vocab_size, shape=(1, 10))
-        user_output = embedding(input)
-        ref_output = mlx_model.model.embed_tokens(input)
-        assert_allclose(user_output, ref_output, precision=mx.bfloat16)
+    actual = qwen3_week1.Qwen3TransformerBlock(**block_kwargs(model))(x, mask)
+    assert_close(actual, expected)
 
 
-@pytest.mark.skipif(
-    not qwen3_0_6b_model_exists(), reason="Qwen3-0.6B-4bit model not found"
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", [(), (3,), (2, 3), (2, 1, 3)])
+def test_task_2_embedding(device, dtype, shape):
+    weight = torch.randn(17, 8, device=device, dtype=dtype)
+    layer = Embedding(17, 8, weight)
+    tokens = torch.randint(17, shape, device=device)
+    assert_close(layer(tokens), torch.nn.functional.embedding(tokens, weight))
+    x = torch.randn(*shape, 8, device=device, dtype=dtype)
+    assert_close(layer.as_linear(x), torch.nn.functional.linear(x, weight))
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("tied", [True, False])
+@torch.inference_mode()
+def test_task_3_qwen_without_download(device, dtype, tied):
+    model = tiny_model(device, dtype, tied=tied)
+    tokens = torch.randint(43, (2, 7), device=device)
+    assert_close(Qwen3ModelWeek1(model)(tokens), model(tokens).logits)
+
+
+@pytest.mark.parametrize(
+    "model_name", ["Qwen/Qwen3-0.6B", "Qwen/Qwen3-1.7B", "Qwen/Qwen3-4B"]
 )
-def test_task_2_embedding_as_linear():
-    mlx_model, _ = load("Qwen/Qwen3-0.6B-MLX-4bit")
-    embedding = Embedding(
-        mlx_model.args.vocab_size,
-        mlx_model.args.hidden_size,
-        dequantize_linear(mlx_model.model.embed_tokens).astype(mx.bfloat16),
+@torch.inference_mode()
+def test_task_3_downloaded_model(model_name):
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    try:
+        path = snapshot_download(model_name, local_files_only=True)
+    except LocalEntryNotFoundError:
+        pytest.skip(f"Download with: hf download {model_name}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = (
+        AutoModelForCausalLM.from_pretrained(
+            path, torch_dtype=torch.bfloat16, local_files_only=True
+        )
+        .to(device)
+        .eval()
     )
-    for _ in range(50):
-        input = mx.random.uniform(shape=(1, 10, mlx_model.args.hidden_size))
-        user_output = embedding.as_linear(input)
-        ref_output = mlx_model.model.embed_tokens.as_linear(input)
-        assert_allclose(user_output, ref_output, precision=mx.bfloat16, atol=1e-1)
-
-
-@pytest.mark.skipif(
-    not qwen3_0_6b_model_exists(), reason="Qwen3-0.6B-4bit model not found"
-)
-def test_task_3_qwen3_0_6b():
-    helper_test_task_3("Qwen/Qwen3-0.6B-MLX-4bit", 5)
-
-
-@pytest.mark.skipif(
-    not qwen3_4b_model_exists(), reason="Qwen3-4B-4bit model not found"
-)
-def test_task_3_qwen3_4b():
-    helper_test_task_3("Qwen/Qwen3-4B-MLX-4bit", 1)
-
-
-@pytest.mark.skipif(
-    not qwen3_1_7b_model_exists(), reason="Qwen3-1.7B-4bit model not found"
-)
-def test_task_3_qwen3_1_7b():
-    helper_test_task_3("Qwen/Qwen3-1.7B-MLX-4bit", 3)
+    tokens = torch.arange(5, device=device)[None]
+    assert_close(Qwen3ModelWeek1(model)(tokens), model(tokens).logits)

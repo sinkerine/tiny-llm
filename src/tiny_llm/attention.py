@@ -1,15 +1,21 @@
-import mlx.core as mx
+import torch
 from .basics import softmax, linear
 
 
 def scaled_dot_product_attention_simple(
-    query: mx.array,
-    key: mx.array,
-    value: mx.array,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
     scale: float | None = None,
-    mask: mx.array | None = None,
-) -> mx.array:
-    pass
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if scale is None:
+        scale = 1 / query.shape[-1] ** 0.5
+    scores = torch.einsum("...qd , ...kd -> ...qk", query, key) * scale
+    if mask is not None:
+        scores += mask
+    attention = softmax(scores, -1)
+    return torch.einsum("...qk , ...kd -> ...qd", attention, value)
 
 
 class SimpleMultiHeadAttention:
@@ -17,45 +23,91 @@ class SimpleMultiHeadAttention:
         self,
         hidden_size: int,
         num_heads: int,
-        wq: mx.array,
-        wk: mx.array,
-        wv: mx.array,
-        wo: mx.array,
+        wq: torch.Tensor,
+        wk: torch.Tensor,
+        wv: torch.Tensor,
+        wo: torch.Tensor,
     ):
-        pass
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.wq = wq
+        self.wk = wk
+        self.wv = wv
+        self.wo = wo
+    def make_head(self, dim: torch.Tensor, weight:torch.Tensor):
+        x = linear(dim, weight)
+        x = x.reshape(*x.shape[:-1], self.num_heads, self.head_dim)
+        x = x.transpose(1,2)
+        return x
 
     def __call__(
         self,
-        query: mx.array,
-        key: mx.array,
-        value: mx.array,
-        mask: mx.array | None = None,
-    ) -> mx.array:
-        pass
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        q = self.make_head(query, self.wq)
+        k = self.make_head(key, self.wk)
+        v = self.make_head(value, self.wv)
+        attention = scaled_dot_product_attention_simple(q, k ,v, scale=None,mask=mask)
+        output = attention.transpose(1,2)
+        output = output.reshape(*output.shape[:-2], self.num_heads * self.head_dim)
+        return linear(output, self.wo)
 
 
-def causal_mask(L: int, S: int, dtype: mx.Dtype) -> mx.array:
-    pass
+def causal_mask(L: int, S: int, dtype: torch.dtype) -> torch.Tensor:
+    if L > S:
+        raise ValueError("Causal attention requires S >= L")
+    q_tbl = torch.arange(L).unsqueeze(1)
+    k_tbl = torch.arange(S).unsqueeze(0)
+    limit_tbl = q_tbl + (S-L)
+    mask = k_tbl <= limit_tbl
+    return torch.where(mask, 0.0, -torch.inf).to(dtype)
 
 
 def scaled_dot_product_attention_grouped(
-    query: mx.array,
-    key: mx.array,
-    value: mx.array,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
     scale: float | None = None,
-    mask: mx.array | str | None = None,
-) -> mx.array:
-    pass
+    mask: torch.Tensor | str | None = None,
+) -> torch.Tensor:
+    batch_shape = query.shape[:-3]
+    H_q, L, D = query.shape[-3:]
+    H, S, _ = key.shape[-3:]
+
+    assert H_q % H == 0
+    n_repeats = H_q // H
+
+    q = query.reshape(*batch_shape, H, n_repeats, L, D)
+    k = key.unsqueeze(-3)
+    v = value.unsqueeze(-3)
+
+    if scale is None:
+        scale = 1 / D ** 0.5
+    qk = torch.einsum("...ld,...sd->...ls", q, k) * scale
+    if isinstance(mask, torch.Tensor):
+        qk += mask.reshape(*batch_shape, H, n_repeats, L, S)
+    elif isinstance(mask, str) and mask == "causal":
+        qk += causal_mask(L,S,query.dtype).to(device=query.device)
+    attention = softmax(qk, -1) @ v
+    return attention.reshape(*batch_shape, H_q, L, D)
 
 
 def paged_attention(
-    query: mx.array,
-    key_pages: mx.array,
-    value_pages: mx.array,
-    block_table: mx.array,
-    context_lens: mx.array,
+    query: torch.Tensor,
+    key_pages: torch.Tensor,
+    value_pages: torch.Tensor,
+    block_table: torch.Tensor,
+    context_lens: torch.Tensor,
     page_size: int,
     scale: float | None = None,
-    mask: mx.array | str | None = None,
-) -> mx.array:
+    mask: torch.Tensor | str | None = None,
+) -> torch.Tensor:
+    """Attend to paged K/V storage without reconstructing a dense cache.
+
+    Week 3 Day 4 owns the correctness-first decode and long-prefill paths for
+    both float32 and BF16. Day 5 optimizes the same public boundary.
+    """
     pass

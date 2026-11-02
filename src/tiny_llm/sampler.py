@@ -1,11 +1,11 @@
-import mlx.core as mx
+import torch
 import copy
 
 
 def make_sampler(temp: float, top_p: float | None, top_k: int | None):
-    def sample(logprobs: mx.array):
+    def sample(logprobs: torch.Tensor):
         if temp == 0:
-            return mx.argmax(logprobs, axis=-1)
+            return torch.argmax(logprobs, dim=-1)
         pass
 
     return sample

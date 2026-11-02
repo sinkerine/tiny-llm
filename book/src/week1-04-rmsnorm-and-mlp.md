@@ -1,5 +1,7 @@
 # Week 1 Day 4: RMSNorm and the Multilayer Perceptron
 
+> This branch uses PyTorch/CUDA for Week 1. See [the CUDA setup guide](https://github.com/sinkerine/tiny-llm/blob/week1/CUDA.md) for tensor API changes, environment setup, and tests. Student tasks remain unfinished. Historical MLX links below are supplemental references.
+
 On Day 4, we will implement two important components of the Qwen3 Transformer architecture: RMSNorm and the multilayer
 perceptron (MLP), also known as the feed-forward network. RMSNorm is a normalization technique with less computational
 overhead than traditional layer normalization. The MLP applies nonlinear transformations after the attention block.
@@ -12,7 +14,7 @@ In this task, we will implement the `RMSNorm` layer.
 src/tiny_llm/layer_norm.py
 ```
 
-Day 3 used `mx.fast.rms_norm` directly so that the GQA chapter could stay focused on attention. This task implements the
+Day 3 used `torch.nn.functional.rms_norm` directly so that the GQA chapter could stay focused on attention. This task implements the
 same normalization rule as a reusable layer. From this point on, the Transformer block, final model normalization, and
 Q/K normalization path can use your `RMSNorm` implementation.
 
@@ -38,7 +40,7 @@ where:
 Apply normalization independently to each feature vector along the input's final dimension. Cast the input to `float32`
 for the normalization calculation, including the mean, to preserve precision when the original values use `float16` or
 `bfloat16`. Cast the normalized value back to the input dtype before applying `weight`. This matches the low-precision
-path used by MLX's fast RMSNorm kernels: normalization statistics are accumulated in `float32`, while the final scaling
+path used by the CUDA reference normalization: normalization statistics are accumulated in `float32`, while the final scaling
 happens in the model dtype.
 
 ```
