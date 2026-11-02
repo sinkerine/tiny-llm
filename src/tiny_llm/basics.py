@@ -12,7 +12,10 @@ def linear(
     w: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    pass
+    result = torch.einsum("...i,...oi->...o", x, w)
+    if bias is not None:
+        result += bias
+    return result
 
 
 def silu(x: torch.Tensor) -> torch.Tensor:

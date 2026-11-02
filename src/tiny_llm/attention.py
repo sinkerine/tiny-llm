@@ -28,7 +28,17 @@ class SimpleMultiHeadAttention:
         wv: torch.Tensor,
         wo: torch.Tensor,
     ):
-        pass
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.wq = wq
+        self.wk = wk
+        self.wv = wv
+        self.wo = wo
+    def make_head(self, dim: torch.Tensor, weight:torch.Tensor):
+        x = linear(dim, weight)
+        x = x.reshape(*x.shape[:-1], self.num_heads, self.head_dim)
+        x = x.transpose(1,2)
+        return x
 
     def __call__(
         self,
@@ -37,7 +47,13 @@ class SimpleMultiHeadAttention:
         value: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        pass
+        q = self.make_head(query, self.wq)
+        k = self.make_head(key, self.wk)
+        v = self.make_head(value, self.wv)
+        attention = scaled_dot_product_attention_simple(q, k ,v, scale=None,mask=mask)
+        output = attention.transpose(1,2)
+        output = output.reshape(*output.shape[:-2], self.num_heads * self.head_dim)
+        return linear(output, self.wo)
 
 
 def causal_mask(L: int, S: int, dtype: torch.dtype) -> torch.Tensor:
