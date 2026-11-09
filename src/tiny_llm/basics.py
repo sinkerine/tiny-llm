@@ -19,4 +19,5 @@ def linear(
 
 
 def silu(x: torch.Tensor) -> torch.Tensor:
-    pass
+    v = torch.exp(-torch.abs(x))
+    return x * torch.where(x >= 0, 1 / (1 + v), v / (v + 1))

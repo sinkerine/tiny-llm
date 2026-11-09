@@ -70,10 +70,15 @@ class Qwen3MLP:
         w_up: torch.Tensor,
         w_down: torch.Tensor,
     ):
-        pass
+        self.w_gate = w_gate
+        self.w_up = w_up
+        self.w_down = w_down
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        pass
+        gate = silu(linear(x, self.w_gate))
+        up = linear(x, self.w_up)
+        up_gated = gate * up
+        return linear(up_gated, self.w_down)
 
 
 class Qwen3TransformerBlock:
