@@ -88,6 +88,7 @@ def scaled_dot_product_attention_grouped(
         scale = 1 / D ** 0.5
     qk = torch.einsum("...ld,...sd->...ls", q, k) * scale
     if isinstance(mask, torch.Tensor):
+        mask = mask.expand(*batch_shape, H_q, L, S)
         qk += mask.reshape(*batch_shape, H, n_repeats, L, S)
     elif isinstance(mask, str) and mask == "causal":
         qk += causal_mask(L,S,query.dtype).to(device=query.device)

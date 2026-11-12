@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 import torch
 from transformers import AutoModelForCausalLM
@@ -51,9 +53,13 @@ def test_task_3_downloaded_model(model_name):
     from huggingface_hub.errors import LocalEntryNotFoundError
 
     try:
-        path = snapshot_download(model_name, local_files_only=True)
+        path = snapshot_download(
+            model_name, cache_dir=Path.home() / ".cache" / "tiny-llm", local_files_only=True
+        )
     except LocalEntryNotFoundError:
-        pytest.skip(f"Download with: hf download {model_name}")
+        pytest.skip(
+            f"Download with: hf download {model_name} --cache-dir ~/.cache/tiny-llm"
+        )
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = (
         AutoModelForCausalLM.from_pretrained(

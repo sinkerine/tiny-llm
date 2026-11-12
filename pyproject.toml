@@ -8,10 +8,11 @@ version = "0.1.0"
 requires-python = ">=3.10, <3.13"
 readme = "README.md"
 dependencies = [
-    # PyTorch 2.13 ships kernels for Blackwell GPUs (including sm_120).
-    "torch>=2.13.0",
-    "torchtune>=0.6.1",
-    "torchao>=0.10.0",
+    # CUDA 12.8 wheels support Blackwell GPUs (including sm_120).
+    "torch>=2.10.0,<2.11",
+    "transformers>=4.51,<5",
+    "huggingface-hub>=0.30",
+    "safetensors>=0.5",
     "numpy>=2.2.4",
     "pytest>=8.3.5",
     "ruff>=0.11.6",
@@ -20,6 +21,19 @@ dependencies = [
     "nanobind==3.1.0",
     "pytest-benchmark>=5.1.0",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.pdm.source]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+include_packages = ["torch"]
 
 [tool.pdm.scripts]
 pre_run = { shell = "pdm sync --no-self > /dev/null" }

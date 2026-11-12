@@ -13,7 +13,9 @@ uv sync --locked
 pdm run check-installation
 ```
 
-The flake pins Python 3.12, uv, PDM, Pyright, Ruff, direnv, and nix-direnv.
+The flake pins Python 3.12, uv, PDM, Pyright, Ruff, direnv, nix-direnv, and
+the Hugging Face CLI (`hf`). It also supplies the CUDA toolkit and build tools.
+Both `nix develop` and direnv activate `.venv` when it exists.
 `uv.lock` pins Python dependencies, including the CUDA 12.8 PyTorch wheels,
 which support Blackwell GPUs such as the RTX 5070 Ti. The wheels include the
 CUDA runtime libraries; Week 1 does not compile custom CUDA extensions.
@@ -71,6 +73,19 @@ set its Python interpreter to that path. Restart the Python LSP after the
 initial dependency installation. No global Neovim configuration is modified.
 
 ## Model loading and generation
+
+Download the required Day 5 checkpoint into the project model cache:
+
+```sh
+hf download Qwen/Qwen3-0.6B --cache-dir ~/.cache/tiny-llm
+# Without automatic direnv activation:
+nix develop --command hf download Qwen/Qwen3-0.6B --cache-dir ~/.cache/tiny-llm
+```
+
+Downloads are explicit; entering the development shell does not download models.
+The Nix shell sets `HF_HUB_CACHE=~/.cache/tiny-llm` so the CLI and Python
+model loader use the same project cache. Day 5 tests explicitly use this path. Optional
+larger checkpoints are `Qwen/Qwen3-1.7B` and `Qwen/Qwen3-4B`.
 
 Use original Hugging Face Qwen3 checkpoints, such as `Qwen/Qwen3-0.6B`, rather
 than MLX quantized checkpoints. `Qwen3ModelWeek1(hf_model)` reads configuration

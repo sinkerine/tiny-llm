@@ -8,10 +8,10 @@ Model-level tests require the corresponding model files. Start with the default 
 only if you want to test them as well:
 
 ```bash
-hf download Qwen/Qwen3-0.6B
+hf download Qwen/Qwen3-0.6B --cache-dir ~/.cache/tiny-llm
 # Optional larger models:
-hf download Qwen/Qwen3-1.7B
-hf download Qwen/Qwen3-4B
+hf download Qwen/Qwen3-1.7B --cache-dir ~/.cache/tiny-llm
+hf download Qwen/Qwen3-4B --cache-dir ~/.cache/tiny-llm
 ```
 
 The deterministic checkpoint tests do not need downloaded model files. The default 0.6B model is required for the final
@@ -167,7 +167,7 @@ Run the tests for this task with:
 
 ```bash
 # The required 0.6B integration check exercises Task 3; download it if it is not already cached.
-hf download Qwen/Qwen3-0.6B
+hf download Qwen/Qwen3-0.6B --cache-dir ~/.cache/tiny-llm
 pdm run test --week 1 --day 5 -- -k task_3
 ```
 

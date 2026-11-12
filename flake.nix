@@ -22,7 +22,13 @@
       devShells.${system}.default = pkgs.mkShell {
         packages = with pkgs; [
           python312
+          uv
           pdm
+          pyright
+          ruff
+          direnv
+          nix-direnv
+          python312Packages.huggingface-hub
           cmake
           ninja
           pkg-config
@@ -41,8 +47,13 @@
         };
 
         shellHook = ''
+          export HF_HUB_CACHE="$HOME/.cache/tiny-llm"
           export PATH="${cuda.cuda_nvcc}/bin:${cuda.cudatoolkit}/bin:$PATH"
           export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath runtimeLibraries}:/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          if [ -x .venv/bin/python ]; then
+            export VIRTUAL_ENV="$PWD/.venv"
+            export PATH="$VIRTUAL_ENV/bin:$PATH"
+          fi
         '';
       };
     };

@@ -82,6 +82,14 @@ pdm run build-ext
 - Use `--` before pytest args (`-k`, `-q`, `--collect-only`, etc.).
 - `pdm run test --week X --day Y` auto-copies `tests_refsol/test_week_X_day_Y.py` into `tests/`.
 - Model-dependent tests (0.5B/1.5B/7B) skip when models are not downloaded locally.
+## Model Cache
+
+- Always download Hugging Face models into `~/.cache/tiny-llm`.
+- Use `hf download Qwen/Qwen3-0.6B --cache-dir ~/.cache/tiny-llm`
+  (and the same cache directory for other models).
+- The Nix shell sets `HF_HUB_CACHE` to this directory. Model-backed tests must
+  resolve checkpoints from this cache, including when run outside the shell.
+
 ## GitHub CLI
 
 - The `gh` CLI is installed, authenticated, and expected to work in this
