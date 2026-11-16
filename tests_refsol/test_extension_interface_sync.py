@@ -80,14 +80,16 @@ DOC_TASK_MARKERS = {
     "book/src/week3-03-paged-attention-part1.md": {
         "Task 1": {
             "TinyKvPagedPool.__init__",
-            "tiny_llm_ext::paged_cache_update",
-            "paged_cache_update_kernel",
+            "TinyKvPagedCache.__init__",
+            "update_and_fetch",
+            "TinyKvPagedCache.gather_dense",
         },
-        "Task 2": {"TinyKvPagedCache.__init__", "update_and_fetch"},
-        "Task 3": {"TinyKvPagedCache.gather_dense", "Qwen3ModelWeek3.create_kv_cache"},
+        "Task 2": {"tiny_llm_ext::paged_cache_update", "paged_cache_update_kernel"},
+        "Task 3": {"Qwen3ModelWeek3.create_kv_cache"},
     },
     "book/src/week3-04-paged-attention-part2.md": {
-        "Task 1": {"TinyKvPagedCache.block_table", "Request.try_prefill"},
+        # Task 1 verifies Day 3 metadata; no functions are assigned to modify.
+        "Task 1": set(),
         "Task 2": {
             "tiny_llm_ext::paged_attention",
             "PagedAttention::eval_gpu",
@@ -172,7 +174,7 @@ EXTENSION_TASK_PAIRS = {
         },
     },
     "book/src/week3-03-paged-attention-part1.md": {
-        "Task 1": {
+        "Task 2": {
             (
                 "src/extensions/src/paged_attention.cpp",
                 "tiny_llm_ext::paged_cache_update",
@@ -419,7 +421,9 @@ def _assert_task_pairs(chapter: str, task: str, pairs: set[tuple[str, str]]) -> 
 def test_starter_and_reference_publish_the_same_learner_extension_functions():
     expected = set(INTERFACES)
     assert _header_functions("src/extensions_ref/src/tiny_llm_ext.h") == expected | {
-        "decode_attention"
+        "decode_attention",
+        "_qk_norm_rope4",
+        "_decode_attention_online",
     }
     assert _header_functions("src/extensions/src/tiny_llm_ext.h") == expected
 
@@ -430,7 +434,12 @@ def test_starter_and_reference_publish_the_same_learner_extension_functions():
         "load_library",
         "axpby",
     }
-    assert reference_bindings == expected | {"decode_attention"}
+    assert reference_bindings == expected | {
+        "decode_attention",
+        "_qk_norm_rope4",
+        "_decode_attention_online",
+        "_submit_decode_prefix_if_ordinary",
+    }
     assert starter_bindings == expected
 
     for function in expected:

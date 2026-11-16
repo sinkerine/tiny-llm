@@ -2,7 +2,7 @@ import mlx.core as mx
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 from datetime import datetime
 
-from .kv_cache import BatchingKvCache
+from .kv_cache_mlx import BatchingKvCache
 
 
 def _step(model, y, offsets, kv_cache):
@@ -117,7 +117,11 @@ def batch_generate(
     start_time = datetime.now()
 
     while True:
-        if len(prompts) == 0 and all(req is None for req in decode_requests):
+        if (
+            len(prompts) == 0
+            and pending_prefill_request is None
+            and all(req is None for req in decode_requests)
+        ):
             break
         # prefill until no idle slots
         if len(prompts) > 0 and pending_prefill_request is None:

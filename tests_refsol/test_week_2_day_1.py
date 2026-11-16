@@ -1,162 +1,108 @@
-"""Week 2 Day 1 dense KV-cache tests."""
+"""Week 2 Day 1: append, bounded capacity, cached decode and serving."""
 
-import mlx.core as mx
 import pytest
-
-from .tiny_llm_base import Qwen3ModelWeek2, TinyKvFullCache
-from .utils import assert_allclose, tiny_qwen3_mlx_model
-
-
-def _fixed_fixture(seed: int):
-    return tiny_qwen3_mlx_model(seed=seed)
+import torch
+from .tiny_llm_base import Qwen3ModelWeek2, TinyKvFullCache, cached_generate
+from .week2_utils import CUDA, tiny_model, assert_close
 
 
-def test_task_1_full_cache_appends_chunks():
-    cache = TinyKvFullCache()
-    key_1 = mx.random.normal((1, 2, 3, 4)).astype(mx.bfloat16)
-    value_1 = mx.random.normal((1, 2, 3, 4)).astype(mx.bfloat16)
-    key_2 = mx.random.normal((1, 2, 2, 4)).astype(mx.bfloat16)
-    value_2 = mx.random.normal((1, 2, 2, 4)).astype(mx.bfloat16)
-
-    first_update = cache.update_and_fetch(key_1, value_1, mask="causal")
-    assert first_update is not None, (
-        "implement the TinyKvFullCache.update_and_fetch learner seam"
+@pytest.mark.parametrize("capacity", [None, 5])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA)])
+def test_task_1_full_cache_appends_chunks(capacity, device):
+    cache = TinyKvFullCache(capacity=capacity)
+    a = torch.arange(12, device=device, dtype=torch.float32).reshape(1, 1, 3, 4)
+    cache.update_and_fetch(a, a + 10, mask="causal")
+    k, v, offset, mask = cache.update_and_fetch(
+        a[:, :, :2] + 20, a[:, :, :2] + 30, mask="causal"
     )
-    cached_key, cached_value, offset, mask = first_update
-    assert offset == 3
-    assert mask == "causal"
-    assert_allclose(cached_key, key_1, mx.bfloat16)
-    assert_allclose(cached_value, value_1, mx.bfloat16)
-
-    cached_key, cached_value, offset, _ = cache.update_and_fetch(key_2, value_2)
-    assert offset == 5
-    assert_allclose(cached_key, mx.concat([key_1, key_2], axis=2), mx.bfloat16)
-    assert_allclose(cached_value, mx.concat([value_1, value_2], axis=2), mx.bfloat16)
+    assert offset == 5 and mask == "causal"
+    assert_close(k, torch.cat((a, a[:, :, :2] + 20), 2), 0, 0)
+    assert_close(v, torch.cat((a + 10, a[:, :, :2] + 30), 2), 0, 0)
+    assert k.shape[-2] == 5
+    if capacity is not None:
+        assert cache.physical_growth_copy_bytes == 0
+        assert cache.slice_write_bytes == (k.numel() + v.numel()) * k.element_size()
 
 
-def test_tasks_2_and_3_cached_checkpoint_is_runnable_and_readable():
-    fixture = _fixed_fixture(0)
-    model = Qwen3ModelWeek2(fixture, checkpoint="kv-cache")
-    cache = model.create_kv_cache()
-    assert len(cache) == fixture.args.num_hidden_layers
-
-    prefill = model(mx.array([[1, 2]], dtype=mx.int32), 0, cache)
-    decoded = model(mx.array([[3]], dtype=mx.int32), 2, cache)
-    complete = model(mx.array([[1, 2, 3]], dtype=mx.int32), 0, model.create_kv_cache())
-    assert prefill.dtype == decoded.dtype == complete.dtype == mx.bfloat16
-    assert prefill.shape == (1, 2, fixture.args.vocab_size)
-    assert decoded.shape == (1, 1, fixture.args.vocab_size)
-    assert_allclose(decoded, complete[:, -1:, :], mx.bfloat16)
-
-
-def test_task_3_rejects_a_position_that_disagrees_with_the_cache():
-    model = Qwen3ModelWeek2(_fixed_fixture(0), checkpoint="kv-cache")
-    with pytest.raises(ValueError):
-        model(mx.array([[1]], dtype=mx.int32), 1, model.create_kv_cache())
-
-
-# Second checkpoint: request-bounded capacity.
-
-
-def _chunk(start: int, length: int):
-    key = mx.arange(start, start + length * 2, dtype=mx.float32).reshape(
-        1, 1, length, 2
-    )
-    return key, key + 100
-
-
-def test_capacity_cache_exposes_only_the_logical_prefix():
-    cache = TinyKvFullCache(capacity=5)
-    key_1, value_1 = _chunk(0, 2)
-    key_2, value_2 = _chunk(4, 1)
-
-    cache.update_and_fetch(key_1, value_1)
-    prefix_update = cache.update_and_fetch(key_2, value_2)
-    assert prefix_update is not None, (
-        "implement the TinyKvFullCache capacity-cache update_and_fetch learner seam"
-    )
-    cached_key, cached_value, offset, _ = prefix_update
-    mx.eval(cached_key, cached_value)
-
-    assert offset == 3
-    assert cached_key.shape == cached_value.shape == (1, 1, 3, 2)
-    assert_allclose(cached_key, mx.concat([key_1, key_2], axis=2), mx.float32)
-    assert_allclose(cached_value, mx.concat([value_1, value_2], axis=2), mx.float32)
-
-    # Unused request capacity must never appear in the returned K/V prefix.
-    assert cached_key.shape[2] == 3 < cache.capacity
-
-
-def test_capacity_rewind_and_overflow_preserve_the_logical_prefix():
+def test_capacity_rewind_overflow_and_reset():
     cache = TinyKvFullCache(capacity=3)
-    key, value = _chunk(0, 2)
-    cache.update_and_fetch(key, value)
+    a = torch.arange(4).float().reshape(1, 1, 2, 2)
+    cache.update_and_fetch(a, a + 10)
     cache.rewind(1)
-    replacement_key, replacement_value = _chunk(20, 2)
-    replacement_update = cache.update_and_fetch(replacement_key, replacement_value)
-    assert replacement_update is not None, (
-        "implement the TinyKvFullCache capacity-cache update_and_fetch learner seam"
-    )
-    cached_key, cached_value, offset, _ = replacement_update
-    mx.eval(cached_key, cached_value)
-
+    k, v, offset, _ = cache.update_and_fetch(a + 20, a + 30)
     assert offset == 3
-    assert_allclose(
-        cached_key,
-        mx.concat([key[:, :, :1], replacement_key], axis=2),
-        mx.float32,
-    )
-    assert_allclose(
-        cached_value,
-        mx.concat([value[:, :, :1], replacement_value], axis=2),
-        mx.float32,
-    )
-
-    with pytest.raises(ValueError, match="capacity 3 exceeded"):
-        extra_key, extra_value = _chunk(30, 1)
-        cache.update_and_fetch(extra_key, extra_value)
+    assert_close(k, torch.cat((a[:, :, :1], a + 20), 2), 0, 0)
+    with pytest.raises(ValueError, match="capacity"):
+        cache.update_and_fetch(a, a)
     assert cache.offset == 3
-
-    # A rejected append must leave the retained prefix available for rewind.
     cache.rewind(1)
-    final_key, final_value = _chunk(40, 1)
-    cached_key, cached_value, offset, _ = cache.update_and_fetch(final_key, final_value)
-    assert offset == 3
-    assert_allclose(
-        cached_key,
-        mx.concat([key[:, :, :1], replacement_key[:, :, :1], final_key], axis=2),
-        mx.float32,
-    )
-    assert_allclose(
-        cached_value,
-        mx.concat([value[:, :, :1], replacement_value[:, :, :1], final_value], axis=2),
-        mx.float32,
-    )
-
+    k, _, offset, _ = cache.update_and_fetch(a[:, :, :1] + 40, a[:, :, :1] + 50)
+    assert offset == 3 and k[0, 0, -1, 0] == 40
     cache.reset()
     assert cache.offset == 0
-    restarted_key, restarted_value = _chunk(60, 1)
-    cached_key, cached_value, offset, _ = cache.update_and_fetch(
-        restarted_key, restarted_value
+    k, _, offset, _ = cache.update_and_fetch(a[:, :, :1], a[:, :, :1])
+    assert offset == 1 and k.shape[-2] == 1
+
+
+@CUDA
+@pytest.mark.parametrize("checkpoint", ["kv-cache", "capacity-cache"])
+@torch.inference_mode()
+def test_tasks_2_and_3_cached_decode_matches_full_and_hf(checkpoint):
+    hf = tiny_model()
+    model = Qwen3ModelWeek2(hf, checkpoint=checkpoint)
+    tokens = torch.tensor([[1, 2, 3]], device="cuda")
+    cache = model.create_kv_cache(
+        capacity=3 if checkpoint == "capacity-cache" else None
     )
-    assert offset == 1
-    assert_allclose(cached_key, restarted_key, mx.float32)
-    assert_allclose(cached_value, restarted_value, mx.float32)
+    model(tokens[:, :2], 0, cache)
+    decoded = model(tokens[:, 2:], 2, cache)
+    full = model(tokens, 0, model.create_kv_cache(capacity=3))
+    assert_close(decoded, full[:, -1:], atol=0.03, rtol=0.03)
+    assert_close(full, hf(tokens).logits, atol=0.08, rtol=0.05)
+    with pytest.raises(ValueError, match="offset"):
+        model(tokens[:, :1], 0, cache)
+    if checkpoint == "capacity-cache":
+        with pytest.raises(ValueError, match="capacity"):
+            model(tokens[:, :1], 3, cache)
 
 
-def test_capacity_checkpoint_runs_the_week2_engine():
-    fixture = _fixed_fixture(0)
-    model = Qwen3ModelWeek2(fixture, checkpoint="capacity-cache")
-    readable_model = Qwen3ModelWeek2(fixture, checkpoint="kv-cache")
-    bounded = model.create_kv_cache(capacity=3)
-    readable = readable_model.create_kv_cache()
-    inputs = mx.array([[1, 2, 3]], dtype=mx.int32)
-    actual = model(inputs, 0, bounded)
-    expected = readable_model(inputs, 0, readable)
+class Tokenizer:
+    eos_token_id = 0
 
-    assert actual.dtype == expected.dtype == mx.bfloat16
-    assert actual.shape == expected.shape == (1, 3, fixture.args.vocab_size)
-    assert_allclose(actual, expected, mx.bfloat16)
-    assert all(cache.offset == 3 for cache in bounded)
-    with pytest.raises(ValueError, match="capacity"):
-        model(mx.array([[4]], dtype=mx.int32), 3, bounded)
+    def encode(self, prompt, **kwargs):
+        return [1, 2] if prompt else []
+
+    def decode(self, tokens, **kwargs):
+        return "".join("A" if int(t) == 3 else "" for t in tokens)
+
+
+def test_task_3_generation_sends_only_new_tokens_and_releases(capsys):
+    class Cache:
+        released = False
+
+        def release(self):
+            self.released = True
+
+    class Model:
+        device = "cpu"
+        use_bounded_kv_capacity = True
+
+        def create_kv_cache(self, capacity=None):
+            assert capacity == 5
+            self.cache = [Cache()]
+            return self.cache
+
+        def __call__(self, tokens, offset, cache, logits_to_keep=None):
+            calls.append((tokens.clone(), offset, logits_to_keep))
+            logits = torch.full((1, 1, 4), -100.0)
+            logits[0, 0, 3 if len(calls) < 3 else 0] = 100
+            return logits
+
+    calls = []
+    model = Model()
+    cached_generate(model, Tokenizer(), "prompt", max_tokens=3)
+    assert capsys.readouterr().out.strip() == "AA"
+    assert [x[0].tolist() for x in calls] == [[[1, 2]], [[3]], [[3]]]
+    assert [x[1] for x in calls] == [0, 2, 3]
+    assert all(x[2] == 1 for x in calls)
+    assert model.cache[0].released

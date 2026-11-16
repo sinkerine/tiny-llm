@@ -1,237 +1,136 @@
-# 🚧 Week 2 Day 5: Tiled Dense Prefill Attention
+# Week 2 Day 5: Tiled Dense Prefill Attention
 
-Complete [Day 4: Fused Model Primitives](./week2-04-fused-model-kernels.md)
-first. You have a cached, packed-W4 Qwen3 model whose `swiglu` checkpoint
-already includes SIMD matrix prefill, RMSNorm, RoPE, and SwiGLU. Day 5 changes
-the dense attention computation for a prompt with at least nine query tokens.
-One-token decode keeps readable grouped attention.
-
-Keep the same cached 0.6B model and request while you work. Save the Day 4
-`swiglu` product result before editing attention; later compare it with
-`tiled-prefill` and the completed `selected` model under that same workload.
-The progression runner uses fresh processes and balanced order. Its `--offline`
-mode needs the model files cached already:
-
-```bash
-pdm run build-ext
-pdm run bench-week2-progression --offline --solution tiny_llm --suite week2 --repeats 2 \
-  --variant week2-swiglu --variant mlx \
-  --model qwen3-0.6b --input-len 128 --output-len 129 --warmup 2 \
-  --prefill-logits last --json-output week2-day5-control.json
-```
-
-The `mlx` row is a separate full-model baseline. Your course model and its
-cache remain the subject of the Day 5 work. Build the supplied reference
-extension and run its completed Day 5 checks to see the target behavior; the
-learner extension retains its own TODOs:
-
-```bash
-pdm run build-ext-ref
-pdm run test-refsol --week 2 --day 5
-```
+Complete [Day 4](./week2-04-fused-model-kernels.md). Today adds tiled
+online-softmax attention to the cached, packed CUDA model. Keep `swiglu` as
+the pre-edit product control. The new checkpoints are `tiled-prefill` and
+`selected`. The learner's `selected` checkpoint names the final teaching feature
+set. Reference `selected` also enables guarded decode/fusion optimizations;
+it is a separate control rather than another learner task.
 
 ## Task 1: Make Tiled Attention Match the Readable Result
 
-The supplied `dense_prefill_attention_mma` adapter in
-`src/tiny_llm/week2_kernels.py` prepares the model-facing arrays and calls
-the learner-owned private `tiny_llm_ext::_dense_attention_prefill_mma` binding.
-Implement that binding and `Week2DensePrefillMMA::eval_gpu` in
-`src/extensions/src/week2_kernels.cpp`, plus
-`week2_dense_prefill_mma_bf16_d128` in
-`src/extensions/src/week2_kernels.metal`. Keep the supplied Python adapter and
-header interface. Replace the `Week2DensePrefillMMA::eval_cpu` starter TODO in
-`src/extensions/src/week2_kernels.cpp` with a GPU-only error. The adapter
-validates the shape, prepares contiguous inputs
-and an optional mask, invokes the native primitive, and restores the
-model-facing shape.
+Implement `dense_prefill_attention_mma` in `src/tiny_llm/week2_kernels.py` and
+`attention_cuda` in `src/cuda/student.cu`. The historical wrapper name is
+retained; it does not prescribe CUDA WMMA for attention. The CUDA reference
+uses warp dot-product reductions and shared-memory tiles, separate from Day
+3's WMMA projection kernel.
 
-The operator accepts grouped-query attention in this layout:
+Inputs are BF16 Q `[B,Hq,L,128]`, K/V `[B,Hkv,S,128]`, with Hq divisible by
+Hkv and L >= 9. Return the same shape/dtype/device as Q. GQA maps query head
+h to KV head `h // (Hq/Hkv)` without physically repeating the K/V arrays.
+
+The reference schedule is BQ4/BK16: four warps own four query rows, while
+a block stages 16 key/value rows in shared memory. Each lane owns four of
+the 128 output coordinates. Reuse the staged tile across query rows and
+iterate over the context. This is the CUDA teaching schedule; historical
+Metal BQ32/BK16 instructions do not describe this kernel.
+
+Maintain a running maximum m, exponential sum l, and weighted value vector
+o for each query. When incorporating score s:
 
 ```text
-Q:      B, Hq,  L, 128
-K, V:   B, Hkv, S, 128
-output: B, Hq,  L, 128
+new_m = max(m, s)
+alpha = exp(m - new_m)
+p = exp(s - new_m)
+l = alpha*l + p
+o = alpha*o + p*value
+m = new_m
 ```
 
-Here `L` is the new prompt length and `S` includes the cached source prefix.
-Require BF16 Q/K/V, equal K/V shapes, matching batch and head dimensions,
-and `Hq % Hkv == 0`. For query head `h`, use KV head
-`floor(h / (Hq / Hkv))`; copying K/V into `Hq` heads would spend the bandwidth
-the grouped layout is meant to save. The model selects the tiled path for a
-supported BF16/D128 prefill with `L >= 9`. The direct operator rejects shorter
-queries; model attention routes them to the readable fallback.
+Initialize m to negative infinity, l/o to zero. Skip masked scores before
+rescaling so `-inf - -inf` cannot produce NaNs. Divide o by l when l > 0,
+otherwise return zero. Accumulate scores, maxima, sums and outputs in FP32,
+then store BF16. Never materialize the full `[B,Hq,L,S]` score matrix.
 
-Start with the supplied causal GQA witness. Its 33 query rows and 47 source
-positions cross both tile boundaries, so a result that only handles complete
-tiles cannot pass:
+Guard query and key tails, but keep all block threads participating in
+shared-memory barriers. An invalid query row must not return early while
+other warps still need a barrier.
 
 ```bash
-pdm run build-ext
-pdm run test --week 2 --day 5 -- -k task_1
+nix develop --command pdm run build-ext
+nix develop --command pdm run test --week 2 --day 5 -- -k online_softmax -q
 ```
-
-The direct attention comparison checks BF16 output against the readable
-result with `atol=0.02, rtol=0.02`; passing it does not measure speed.
-
-The intended computation is the same scaled dot-product attention as the
-readable control. Process **BQ32** query rows and **BK16** source positions at a
-time with four 32-lane SIMD groups. Cooperatively load a 32×128 Q tile and a
-16×128 K tile, accumulate score fragments, then reuse the K/V storage for the
-matching V tile. The source layout uses 128 threads and 12,928 bytes of Q and
-K/V threadgroup storage; those sizes describe the implementation, not its
-speed. Two padding elements per shared-tile row account for the storage above
-the raw Q plus K/V payload. Guard both partial tails before any load or output
-write.
-
-For each query row, keep an FP32 running maximum `m`, exponential sum `l`, and
-weighted value accumulator `a`. If the next source tile contributes maximum
-`m_b`, sum `l_b`, and accumulator `a_b`, merge them as follows:
-
-$$
-m' = \max(m,m_b), \qquad
-l' = e^{m-m'}l + e^{m_b-m'}l_b,
-$$
-
-$$
-a' = e^{m-m'}a + e^{m_b-m'}a_b,
-\qquad \mathrm{output} = a'/l'.
-$$
-
-In words, choose the larger of the old and tile maxima. Multiply the old sum
-and accumulator by the exponential of old maximum minus new maximum; multiply
-the tile sum and accumulator by the exponential of tile maximum minus new
-maximum. Add each pair, then divide the new accumulator by the new sum.
-Rescale the old numerator **and** denominator when a later tile raises the
-maximum. Padded score cells contribute no probability mass. Return BF16 only
-after the final FP32 normalization. This avoids an allocated `L × S` score
-workspace, but it still reads dense K/V; a caller-supplied additive mask can
-itself have `L × S` entries.
 
 ## Task 2: Preserve Masks and the Readable Fallback
 
-Accept no mask, the string `"causal"`, or a broadcastable additive array mask.
-Causality is aligned to the end of the cached prefix: query row `i` may see
-source positions through `S - L + i`. For `L = 3` and `S = 7`, the first new
-query can see positions 0–4. Applying a triangle as if the source length were
-three would erase useful cached context. Broadcast an explicit mask over batch
-and query-head dimensions, then apply it before the online-softmax update.
+Causal masking is bottom-right aligned: key position s is allowed for query
+i when `s <= S-L+i`. Additive masks broadcast to `[B,Hq,L,S]`; the wrapper
+converts them to contiguous FP32. Fully masked rows return zeros. Reject
+unsupported strings, incompatible GQA shapes and wrong dtypes before a
+native launch.
 
-A fully masked row has no probability mass. Skip tiles with no valid scores
-and make the row's output finite and all zero; do not divide by zero or
-propagate `NaN`. The focused mask witness uses
-nine BF16 query rows, 17 source positions, and an all-negative-infinity
-additive mask:
-
-```bash
-pdm run build-ext
-pdm run test --week 2 --day 5 -- -k task_2
-```
-
-In `Qwen3MultiHeadAttention.__call__`, keep readable grouped attention for
-one-token decode, `L <= 8`, and any model shape outside the tiled BF16/D128
-boundary. The readable path must receive the same cache update, scale, mask,
-query-to-KV-head mapping, and output dtype. Keep separate diagnostic counts
-for `tiled_prefill`, `tiled_prefill_fallback`, and `readable`: the fallback count
-records that the tiled feature was enabled but ineligible, while `readable`
-records the actual computation. These are reference diagnostics to inspect;
-the supplied learner tests check public output rather than internal counter
-values. A green long-query operator comparison alone does not verify decode.
-
-If you choose the operator off-ramp, keep this model and cache interface and
-substitute the equivalent MLX attention operator or readable grouped equation
-at this boundary. `--solution mlx` instead runs a separate complete model.
+Keep PyTorch scaled-dot-product attention for short-query decode, non-BF16
+inputs, or head dimensions other than 128 in the teaching `tiled-prefill`
+checkpoint. Reference `selected` uses native online decode for eligible
+single-token BF16/D128 queries up to 32768 context tokens, splitting contexts
+over 256 tokens into stable softmax partitions. The CUDA kernel reads
+capacity-strided K/V directly and shares long-context K/V tiles for GQA4. `DENSE_PREFILL_MIN_QUERY=9`
+selects the tiled route; the direct wrapper rejects shorter queries.
+The operator tests cover L=9/17/33, rectangular contexts, grouped heads,
+additive masks and fully masked rows.
 
 ## Task 3: Run `tiled-prefill` in the Model
 
-Wire the eligible attention call through `Qwen3ModelWeek2` and its transformer
-layers. The `tiled-prefill` checkpoint retains every Day 4 operator, bounded
-cache, and packed projection; it changes only supported dense prefill
-attention. Check its focused model behavior and run the live model:
+Only attention changes relative to `swiglu`. Route eligible prefill through
+your native operator, while preserving cached decode and all earlier packed
+and fused features. Track `tiled_prefill`, `tiled_prefill_fallback`, and
+`readable` dispatch counts so tests can verify the intended route actually
+ran instead of merely accepting numerically similar output.
 
 ```bash
-pdm run build-ext
-pdm run test --week 2 --day 5 -- -k task_3
-pdm run main --solution tiny_llm --loader week2 \
-  --week2-checkpoint tiled-prefill --model qwen3-0.6b --max-tokens 16
+nix develop --command pdm run test --week 2 --day 5 -- -q
+nix develop --command pdm run main --solution tiny_llm --loader week2 \
+  --week2-checkpoint tiled-prefill --model Qwen/Qwen3-0.6B --max-tokens 32
 ```
-
-The supplied three-token model witness guards the readable branch. The
-ten-token BF16/D128 model witness is eligible for tiled attention; the 33×47
-operator witness also crosses both tile tails. Inspect the reference fallback
-and tiled dispatch counts separately. The matched 128-token product workload exercises
-the tiled branch in the real model; a matching output alone cannot tell you
-which kernel ran.
 
 ## Finish the Cumulative `selected` Model
 
-`selected` is the named final Week 2 checkpoint, not an additional Metal
-kernel. It keeps the `tiled-prefill` feature set: request-bounded KV capacity,
-register-cached RMSNorm, the tiled prefill selector, packed W4 projections,
-SIMD matrix prefill, RoPE, and SwiGLU. Each of the capacity, RMSNorm, and tiled
-attention controls can also be switched off independently for a matched
-counterfactual. The short attention fallback and wider-row RMSNorm fallback
-remain part of this model.
-
-First verify the supplied selected-model controls, then run the same completed
-course model through the public CLI:
+Run the final named checkpoint on the same cached model:
 
 ```bash
-pdm run test --week 2 --day 5 -- -k selected
-pdm run main --solution tiny_llm --loader week2 \
-  --week2-checkpoint selected --model qwen3-0.6b --max-tokens 16
+nix develop --command pdm run main --solution tiny_llm --loader week2 \
+  --week2-checkpoint selected --model Qwen/Qwen3-0.6B --max-tokens 32
 ```
 
-The test checks the cumulative model and its independently disabled controls;
-the model comparison uses `atol=0.75, rtol=0.05`. Its observable assertions
-do not prove a particular private dispatch. The CLI run shows that the named
-final checkpoint can answer a request. Then run the complete Day 5 learner gate:
-
-```bash
-pdm run test --week 2 --day 5
-```
-
-Once complete, `selected` is the
-default Week 2 checkpoint, but name it explicitly in measurements so the
-comparison remains legible.
+Reference runs use `--solution tiny_llm_ref`. They verify the port and provide
+controls; they do not complete student exercises. No checkpoint imports MLX,
+compiles Metal or requires Apple tooling on this route.
 
 ## Measure the Matched Product
 
-Compare the saved pre-edit `swiglu` row with a new `swiglu` row first. Then
-compare `swiglu`, `tiled-prefill`, `selected`, and the full MLX model under one
-cached 0.6B request, device, prefill-logit mode, and warmup count:
-
 ```bash
-pdm run bench-week2-progression --offline --solution tiny_llm --suite week2 --repeats 2 \
-  --variant week2-swiglu --variant week2-tiled-prefill \
-  --variant week2-selected --variant mlx \
-  --model qwen3-0.6b --input-len 128 --output-len 129 --warmup 2 \
-  --prefill-logits last --json-output week2-day5-product.json
+nix develop --command pdm run bench-week2-cuda --solution tiny_llm \
+  --checkpoint swiglu --checkpoint tiled-prefill --checkpoint selected \
+  --prefill-tokens 128 --decode-tokens 16 --prefill-logits all --repeats 3 \
+  --profile /tmp/week2-day5.json
 ```
 
-A 128-token prompt crosses the `L >= 9` selector boundary. Report the prefill
-and complete-request results separately; the `selected` and `tiled-prefill`
-rows name the same default feature set, so do not count any difference between
-them as a second mechanism gain. Inspect which kernel category dominates under
-the same 0.6B model and 128-token prefill shape:
+Report prefill and decode separately with model, GPU, shapes, logit mode,
+warmups and repetitions. This educational tiled kernel may be slower than
+PyTorch's optimized SDPA. Online softmax bounds intermediate score storage;
+it does not guarantee lower latency. Historical Apple benchmark results and
+Metal capture commands are not measurements of this CUDA checkout.
+
+Week 2's active CUDA route ends here. Week 3 remains the historical MLX/Metal
+route and requires a separate backend port before tutoring on Linux/CUDA.
+
+## Profile Before and After
+
+Follow [Find the Next Bottleneck](./week2-profile-guided.md): save the
+`swiglu` baseline before editing, state a mechanism, run correctness
+checks, then compare `tiled-prefill` under the same request workload.
+Retain regressions and mark keep/reject/inconclusive; an operator share is
+not a predicted request speedup.
 
 ```bash
-pdm run profile-week2-kernels --solution tiny_llm --model qwen3-0.6b \
-  --case swiglu:prefill:128 --case tiled-prefill:prefill:128 \
-  --case selected:prefill:128 --warmup 4 --iterations 12 \
-  --json-output week2-day5-attribution.json
+nix develop --command pdm run profile-week2-kernels --solution tiny_llm \
+  --model Qwen/Qwen3-0.6B --case swiglu:decode:128 \
+  --case tiled-prefill:decode:128 --warmup 4 --iterations 12 \
+  --json-output tiled-prefill-decode.replay.json
 ```
 
-This attribution replays kernel groups on synthetic token IDs; it does not
-replace the complete-request comparison. Record whether the tiled path ran
-and what later category dominates. An operator result or a historical 4B number
-cannot establish a speedup for this 0.6B checkout. The
-[performance appendix](./appendix-performance.md) keeps earlier measurements
-and unavailable rows as historical evidence. A matched 4B follow-up is
-optional after caching that model; repeat every compared row at 4B rather than
-mixing model sizes.
-
-Week 2 now supplies a tested single-request model boundary for
-[Week 3](./week3-overview.md), where paging and batching add new state and
-scheduling work. It does not turn one request into a production serving policy.
+For prefill changes, repeat both cases with `prefill` instead of `decode`.
+The CUDA request benchmark also reports peak allocated tensor bytes and full
+request wall time. Preserve their recorded scopes and source/workload identity.
 
 {{#include copyright.md}}

@@ -1,0 +1,2 @@
+# Preserve captured validation output verbatim, including model-emitted spaces.
+docs/validation/**/*.log -whitespace

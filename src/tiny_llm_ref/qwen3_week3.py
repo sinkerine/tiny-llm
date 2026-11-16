@@ -4,11 +4,11 @@ import mlx.core as mx
 
 from .attention import paged_attention
 from .embedding import QuantizedEmbedding
-from .kv_cache import TinyKvCache
+from .kv_cache_mlx import TinyKvCache
 from .moe import Moe
 from .paged_kv_cache import TinyKvPagedCache, TinyKvPagedPool
-from .quantize import QuantizedWeights, quantized_linear
-from .week2_kernels import (
+from .quantize_mlx import QuantizedWeights, quantized_linear
+from .week2_kernels_mlx import (
     FastRMSNorm,
     FastRoPE,
     decode_attention_custom,

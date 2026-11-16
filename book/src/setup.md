@@ -1,127 +1,78 @@
 # Setting Up the Environment
 
-This checkout uses Nix flakes and direnv to provide a reproducible development
-shell on NixOS. The target accelerator is an NVIDIA GPU with CUDA, not Apple
-silicon. The project uses PDM for Python dependency management inside the Nix
-shell.
-
-Before starting, configure the NVIDIA driver in NixOS and verify it with:
-
-```bash
-nvidia-smi
-```
-
-Your NixOS configuration should enable flakes and direnv. A typical setup
-includes `programs.direnv.enable = true;` and
-`programs.direnv.nix-direnv.enable = true;`.
+This checkout runs Weeks 1–2 on Linux with PyTorch and NVIDIA CUDA. Week 2
+adds native C++/CUDA extensions. Weeks 3–4 remain the historical MLX/Metal
+route. See [CUDA.md](../../CUDA.md) for detailed environment notes.
 
 ## Clone the Repository
 
 ```bash
-git clone https://github.com/skyzh/tiny-llm
+git clone https://github.com/sinkerine/tiny-llm
+cd tiny-llm
 ```
 
-The repository is organized as follows:
-
-```
-src/tiny_llm/ -- your implementation
-src/tiny_llm_ref/ -- the reference implementation
-tests/ -- unit tests for your implementation
-tests_refsol/ -- unit tests for the reference implementation
-book/ -- the book source
-```
-
-Reference implementations are available if you get stuck during the course.
+Student implementations live in `src/tiny_llm`, separate references in
+`src/tiny_llm_ref`, learner tests in `tests`, and reference tests in
+`tests_refsol`. Book sources live in `book` and native CUDA code in `src/cuda`.
+Reference code provides controls; do not fill your learner exercises from it.
 
 ## Install Dependencies
 
-```bash
-cd tiny-llm
-# Allow direnv to load flake.nix. This enters the CUDA development shell.
-direnv allow
-# This creates .venv and installs all Python dependencies.
-pdm install -v
-# Activate the newly-created .venv in the direnv shell.
-direnv reload
-```
-
-## Check the Installation
+Configure a working host NVIDIA driver and enable Nix flakes. Verify the
+GPU, enter the development shell and install the locked Python environment:
 
 ```bash
+nvidia-smi
+nix develop
+uv sync --locked
 pdm run check-installation
 ```
 
-## Build the Native Extensions Before Tests
+The shell supplies Python 3.12, PDM, uv, PyTorch-compatible CUDA tooling,
+CMake, Ninja and the compiler. Optionally use direnv with `direnv allow`;
+it activates the same environment. No Xcode, Metal or MLX package is required
+for the active Weeks 1–2 route.
 
-Week 1 test collection reaches the learner and reference native extensions
-through package imports, even though the Day 1 attention exercise is in
-Python. Before running either test command on a fresh checkout, prepare full
-Xcode, its Metal compiler, and CMake 3.27 or newer; the
-[toolchain steps in Week 1 Day 7](./week1-07-sampling-prepare.md#task-2-prepare-for-week-2)
-give the installation checks. Then, from the repository root, build both
-extensions:
+## Run Unit Tests
+
+Start with a day's focused task, then its complete suite:
+
+```bash
+pdm run test-refsol --week 1 --day 1 -- -k task_1 -q
+pdm run test --week 1 --day 1 -- -k task_1 -q
+```
+
+Weeks 1 and Week 2 Day 1 need no native build for collection. Before Week 2
+Day 2, compile both separate extensions:
 
 ```bash
 pdm run build-ext
 pdm run build-ext-ref
+pdm run build-ext-test
 ```
 
-The reference build supplies its native import; it does not implement the
-learner TODOs in `src/tiny_llm`.
+The build smoke check confirms bindings load; learner kernels remain
+unfinished and raise errors until implemented. Builds use external scratch
+paths documented in [CUDA.md](../../CUDA.md). Rebuild after native edits.
+Tests use deterministic tiny Hugging Face models without downloads. Native
+checks require a CUDA GPU with BF16 tensor-core support; a skip is not a pass.
 
-Check the completed Day 1 reference exercise before working on your starter:
+## Download the Model Parameters
+
+Weeks 1–2 load the same original Hugging Face model. Download explicitly to
+the project cache; the Nix shell configures the loader to use it:
 
 ```bash
-pdm run test-refsol --week 1 --day 1 -- -k task_1
-# The reference solution should pass all Week 1 tests.
-pdm run test-refsol -- -- -k week_1
+hf download Qwen/Qwen3-0.6B --cache-dir ~/.cache/tiny-llm
+pdm run main --solution tiny_llm_ref --loader week1 --max-tokens 64
+# After building the reference CUDA extension:
+pdm run main --solution tiny_llm_ref --loader week2 \
+  --week2-checkpoint selected --max-tokens 64
 ```
 
-This command runs a small PyTorch CUDA matmul smoke check. Course tests and
-model-loading instructions still target the legacy MLX/Metal code; defer them
-until the CUDA rewrite is complete.
-
-## Run Unit Tests (after CUDA rewrite)
-
-Your code is in `src/tiny_llm`. You can run the unit tests with:
-
-```bash
-pdm run test
-```
-
-## Download the Model Parameters (legacy, deferred)
-
-The original course uses official 4-bit Qwen3 MLX model files. These files and
-commands belong to the legacy MLX implementation; skip this section while the
-CUDA model loader is being rewritten. No MLX package is installed by this
-environment.
-
-The legacy default model is `Qwen/Qwen3-0.6B-MLX-4bit`, which is small enough
-for the original dequantized Python implementation in Week 1.
-
-Follow the [Hugging Face CLI guide](https://huggingface.co/docs/huggingface_hub/main/en/guides/cli) to install the `hf`
-command-line tool.
-
-The model parameters are hosted on Hugging Face. After authenticating the CLI with your credentials, download them with:
-
-```bash
-hf auth login
-hf download Qwen/Qwen3-0.6B-MLX-4bit
-# Optional larger models:
-hf download Qwen/Qwen3-1.7B-MLX-4bit
-hf download Qwen/Qwen3-4B-MLX-4bit
-```
-
-Legacy path only (not currently supported by the CUDA environment):
-
-```bash
-pdm run main --solution ref --loader week1
-```
-
-The command should load the reference model and print generated text.
-
-The Nix shell supplies CUDA 13.0, CMake, Ninja, and the compiler toolchain.
-The checked-in Python and custom-extension implementations still target MLX
-and Metal; their CUDA rewrites are pending.
+Week 2 packs BF16 checkpoint weights into its teaching W4 format locally;
+MLX-quantized checkpoints are not compatible with this loader. Larger models
+are optional and must use the same cache directory. Network downloads never
+happen just from entering the development shell.
 
 {{#include copyright.md}}

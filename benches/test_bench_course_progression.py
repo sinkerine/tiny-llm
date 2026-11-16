@@ -119,20 +119,20 @@ def test_week2_live_labels_follow_the_five_day_book():
     for title in (
         "Day 1: Cache and Measure",
         "Day 2: Keep W4 Packed",
-        "Day 3: SIMD Matrix Prefill",
+        "Day 3: Tensor-Core Matrix Prefill",
         "Day 4: Fused Model Primitives",
     ):
         assert title in week2_summary
     day5_doc = ROOT / "book/src/week2-05-tiled-prefill-attention.md"
     if day5_doc.exists():
         assert "Day 5: Tiled Dense Prefill Attention" in week2_summary
-    assert len(re.findall(r"\[🚧 Day \d:", week2_summary)) == 4 + day5_doc.exists()
+    assert len(re.findall(r"\[(?:🚧 )?Day \d:", week2_summary)) == 4 + day5_doc.exists()
 
     chapter_headings = {
-        "week2-01-kv-cache.md": "# 🚧 Week 2 Day 1: Reuse the Prefix, Then Bound the Cache",
-        "week2-02-quantize-model.md": "# 🚧 Week 2 Day 2: Keep W4 Packed",
-        "week2-03-simd-matrix-prefill.md": "# 🚧 Week 2 Day 3: SIMD Matrix Prefill",
-        "week2-04-fused-model-kernels.md": "# 🚧 Week 2 Day 4: Fused Model Primitives",
+        "week2-01-kv-cache.md": "# Week 2 Day 1: Reuse the Prefix, Then Bound the Cache",
+        "week2-02-quantize-model.md": "# Week 2 Day 2: Keep W4 Packed",
+        "week2-03-simd-matrix-prefill.md": "# Week 2 Day 3: Tensor-Core Matrix Prefill",
+        "week2-04-fused-model-kernels.md": "# Week 2 Day 4: Fused Model Primitives",
     }
     for filename, expected_heading in chapter_headings.items():
         heading = (ROOT / "book/src" / filename).read_text().splitlines()[0]
@@ -141,7 +141,7 @@ def test_week2_live_labels_follow_the_five_day_book():
     if day5_doc.exists():
         assert (
             day5_doc.read_text().splitlines()[0]
-            == "# 🚧 Week 2 Day 5: Tiled Dense Prefill Attention"
+            == "# Week 2 Day 5: Tiled Dense Prefill Attention"
         )
 
     readme = (ROOT / "README.md").read_text()
@@ -266,7 +266,10 @@ def test_required_week2_progression_uses_portable_checks_not_local_capture():
         assert f"pdm run test --week 2 --day {day}" in chapter
         assert "--week2-checkpoint decode-attention" not in chapter
         assert "--week2-checkpoint split-k" not in chapter
-    assert "`gpudebug` output, screenshot, or device-specific counter gates" in days[1]
+    assert (
+        "Nsight captures, screenshots and device-specific counters are optional"
+        in days[1]
+    )
     for day in days.keys() - {1}:
         assert not any(
             token in days[day]

@@ -1,9 +1,9 @@
 # tiny-llm
 
-This branch ports **Week 1 to PyTorch/CUDA on Linux** and preserves student
-exercise stubs. See [CUDA setup, tests, direnv, and Neovim completion](CUDA.md)
-for the local workflow. Weeks 2–4 and the upstream description below still
-target MLX/Metal.
+This branch ports **Weeks 1–2 to PyTorch/CUDA on Linux** and preserves student
+exercise stubs. Week 2 includes native C++/CUDA reference kernels, tests and
+active chapters. See [CUDA setup, tests, direnv, and Neovim completion](CUDA.md)
+for the local workflow. Weeks 3–4 remain historical MLX/Metal routes.
 
 [![CI (main)](https://github.com/skyzh/tiny-llm/actions/workflows/main.yml/badge.svg)](https://github.com/skyzh/tiny-llm/actions/workflows/main.yml)
 
@@ -19,10 +19,9 @@ small enough to read end to end makes it possible to connect the equations to
 memory traffic, kernel occupancy, KV-cache growth, batching, and request
 scheduling.
 
-The upstream course uses MLX arrays and Metal extensions. This checkout is
-being rewritten for PyTorch, CUDA, and native CUDA kernels. The checked-in
-course implementation still contains the old MLX/Metal path; it is not the
-active CUDA implementation and will be replaced during the port.
+The upstream course uses MLX arrays and Metal extensions. The active Weeks
+1–2 path in this checkout uses PyTorch and native CUDA kernels. Historical
+Apple implementations and benchmark tools remain separate from that path.
 
 ## The Learning Path
 
@@ -31,12 +30,12 @@ describing MLX/Metal are legacy material until their CUDA rewrites land.
 
 The course follows a four-week learning path:
 
-- **Week 1: From Matmul to Text.** Build a Qwen3 model directly from `mlx.core`
+- **Week 1: From Matmul to Text.** Build a Qwen3 model directly from PyTorch
   array operations: attention, RoPE, GQA, RMSNorm, the MLP, sampling, and
   the autoregressive loop.
 - **Week 2: A Faster Single Request.** Day 1 adds `kv-cache` and
   request-bounded `capacity-cache`; Day 2 keeps W4 projection weights packed
-  through the `quantized-matvec` checkpoint. Day 3 adds SIMD matrix prefill at
+  through the `quantized-matvec` checkpoint. Day 3 adds CUDA WMMA prefill at
   `simd-matmul`. Day 4 adds cumulative RMSNorm, RoPE, and SwiGLU checkpoints.
   Day 5 adds `tiled-prefill` and runs the completed `selected` model.
 - **Week 3: Build a Mini vLLM.** Introduce continuous
@@ -75,14 +74,14 @@ existing checkout with:
 ```bash
 # Requires Nix flakes and direnv. `direnv allow` loads flake.nix.
 direnv allow
-pdm install -v
+uv sync --locked
 direnv reload
 pdm run check-installation
 ```
 
-`check-installation` runs a small PyTorch CUDA matmul smoke check. Course tests
-and model-loading chapters still target the legacy MLX/Metal code and remain
-deferred until their CUDA rewrites land.
+`check-installation` runs a small PyTorch CUDA matmul smoke check. Follow the
+local [setup chapter](book/src/setup.md) and [Week 2 overview](book/src/week2-overview.md)
+for CUDA commands; the upstream published book may describe a different backend.
 
 The `tiny_llm` package is where students implement the exercises.
 `tiny_llm_ref` contains the reference solution used by the tests and benchmark
@@ -158,3 +157,6 @@ cross-request prefix caching, fine-tuning, and long-context techniques.
 Join skyzh's Discord server to study with the tiny-llm community.
 
 [![Join skyzh's Discord Server](book/src/discord-badge.svg)](https://skyzh.dev/join/discord)
+
+Upstream also links the community port [amagilabs/tiny-llm-cuda](https://github.com/amagilabs/tiny-llm-cuda),
+which uses MLX's CUDA backend. This checkout instead uses PyTorch and native C++/CUDA.

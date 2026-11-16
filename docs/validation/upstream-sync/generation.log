@@ -1,0 +1,4 @@
+warning: Git tree '/home/sinkerine/dev/tiny-llm' is dirty
+STATUS: Resolving packages from lockfile...
+`torch_dtype` is deprecated! Use `dtype` instead!
+CUDA sync works.

@@ -1,7 +1,7 @@
 from model_names import shortcut_name_to_full_name
 
 from .qwen3_week1 import Qwen3ModelWeek1
-from .qwen3_week2 import Qwen3ModelWeek2
+from .qwen3_week2_mlx import Qwen3ModelWeek2
 from .qwen3_week3 import Qwen3ModelWeek3
 
 

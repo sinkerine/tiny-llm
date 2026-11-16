@@ -1,0 +1,391 @@
+{
+  "schema_version": 3,
+  "profile_kind": "public-operator-replay",
+  "source": {
+    "commit": "8265905d460fd3fb44ec1decb59950eccfe354e5",
+    "tree": "4f07753afccf9a487e3caa0ad7757501d9f377b3",
+    "tracked_dirty": true
+  },
+  "solution": "tiny_llm_ref",
+  "model": "Qwen/Qwen3-0.6B",
+  "software": {
+    "torch": "2.10.0+cu128",
+    "transformers": "4.57.6",
+    "python": "3.12.14"
+  },
+  "host": {
+    "machine": "x86_64",
+    "platform": "Linux-6.18.59-x86_64-with-glibc2.42",
+    "device": "NVIDIA GeForce RTX 5070 Ti",
+    "cuda": "12.8"
+  },
+  "warmup": 1,
+  "iterations": 2,
+  "profiles": [
+    {
+      "schema_version": 3,
+      "profile_kind": "public-operator-replay",
+      "checkpoint": "capacity-cache",
+      "workload": {
+        "model": "Qwen/Qwen3-0.6B",
+        "phase": "decode",
+        "tokens": 16,
+        "query_length": 1,
+        "position_offset": 15,
+        "request_bound": 16,
+        "prompt_rule": "seed-0-independent-operands-and-zero-token-ids",
+        "fixture_seed": 0,
+        "prefill_logits": "last",
+        "warmup": 1,
+        "iterations": 2,
+        "profile_kind": "public-operator-replay",
+        "adapter_version": 2,
+        "rope_offset_preparation": "once-per-pointwise-sample-inside-timing"
+      },
+      "workload_id": "f589f5e1b0057e99f4744147ed3e992f9a8b319dc063b964305430212c504798",
+      "coverage": {
+        "complete": true
+      },
+      "shape": {
+        "layers": 28,
+        "hidden": 1024,
+        "intermediate": 3072,
+        "heads": 16,
+        "kv_heads": 8,
+        "head_dim": 128,
+        "vocab": 151936,
+        "dtype": "bfloat16"
+      },
+      "effective_features": {
+        "bounded_kv_capacity": true,
+        "quantized_weights": false,
+        "fast_rms_norm": false,
+        "fast_rope": false,
+        "fast_swiglu": false,
+        "simdgroup_matmul": false,
+        "tiled_prefill_attention": false,
+        "native_online_decode": false,
+        "fused_qk_norm_rope4": false,
+        "decode_submit18": false
+      },
+      "cache": {
+        "before_offset": 15,
+        "after_offset": 16,
+        "capacity": 16,
+        "request_bound": 16,
+        "first_update_from_empty": false,
+        "counter_kind": "nominal-python-accounting",
+        "counter_deltas": {
+          "logical_copy_bytes": 0,
+          "physical_growth_copy_bytes": 0,
+          "slice_write_bytes": 114688,
+          "growth_copy_bytes": 0
+        }
+      },
+      "replay_total_us": 8805.555000435561,
+      "share_denominator": "sum-of-synchronized-public-group-medians",
+      "rope_offset_preparation": "once-per-pointwise-sample-inside-timing",
+      "categories": [
+        {
+          "name": "projections",
+          "median_us": 1954.8335003491957,
+          "share": 0.22200003296243123
+        },
+        {
+          "name": "attention",
+          "median_us": 263.4865013533272,
+          "share": 0.02992275913787308
+        },
+        {
+          "name": "normalization, position, and activation",
+          "median_us": 6266.746999244788,
+          "share": 0.711681092098659
+        },
+        {
+          "name": "KV cache update",
+          "median_us": 320.48799948825035,
+          "share": 0.03639611580103669
+        }
+      ],
+      "source": {
+        "commit": "8265905d460fd3fb44ec1decb59950eccfe354e5",
+        "tree": "4f07753afccf9a487e3caa0ad7757501d9f377b3",
+        "tracked_dirty": true
+      },
+      "solution": "tiny_llm_ref",
+      "model": "Qwen/Qwen3-0.6B",
+      "software": {
+        "torch": "2.10.0+cu128",
+        "transformers": "4.57.6",
+        "python": "3.12.14"
+      },
+      "host": {
+        "machine": "x86_64",
+        "platform": "Linux-6.18.59-x86_64-with-glibc2.42",
+        "device": "NVIDIA GeForce RTX 5070 Ti",
+        "cuda": "12.8"
+      },
+      "warmup": 1,
+      "iterations": 2
+    },
+    {
+      "schema_version": 3,
+      "profile_kind": "public-operator-replay",
+      "checkpoint": "quantized-matvec",
+      "workload": {
+        "model": "Qwen/Qwen3-0.6B",
+        "phase": "decode",
+        "tokens": 16,
+        "query_length": 1,
+        "position_offset": 15,
+        "request_bound": 16,
+        "prompt_rule": "seed-0-independent-operands-and-zero-token-ids",
+        "fixture_seed": 0,
+        "prefill_logits": "last",
+        "warmup": 1,
+        "iterations": 2,
+        "profile_kind": "public-operator-replay",
+        "adapter_version": 2,
+        "rope_offset_preparation": "once-per-pointwise-sample-inside-timing"
+      },
+      "workload_id": "f589f5e1b0057e99f4744147ed3e992f9a8b319dc063b964305430212c504798",
+      "coverage": {
+        "complete": true
+      },
+      "shape": {
+        "layers": 28,
+        "hidden": 1024,
+        "intermediate": 3072,
+        "heads": 16,
+        "kv_heads": 8,
+        "head_dim": 128,
+        "vocab": 151936,
+        "dtype": "bfloat16"
+      },
+      "effective_features": {
+        "bounded_kv_capacity": true,
+        "quantized_weights": true,
+        "fast_rms_norm": false,
+        "fast_rope": false,
+        "fast_swiglu": false,
+        "simdgroup_matmul": false,
+        "tiled_prefill_attention": false,
+        "native_online_decode": false,
+        "fused_qk_norm_rope4": false,
+        "decode_submit18": false
+      },
+      "cache": {
+        "before_offset": 15,
+        "after_offset": 16,
+        "capacity": 16,
+        "request_bound": 16,
+        "first_update_from_empty": false,
+        "counter_kind": "nominal-python-accounting",
+        "counter_deltas": {
+          "logical_copy_bytes": 0,
+          "physical_growth_copy_bytes": 0,
+          "slice_write_bytes": 114688,
+          "growth_copy_bytes": 0
+        }
+      },
+      "replay_total_us": 9230.853002009098,
+      "share_denominator": "sum-of-synchronized-public-group-medians",
+      "rope_offset_preparation": "once-per-pointwise-sample-inside-timing",
+      "categories": [
+        {
+          "name": "projections",
+          "median_us": 2211.279501352692,
+          "share": 0.23955310531663826
+        },
+        {
+          "name": "attention",
+          "median_us": 259.0570002212189,
+          "share": 0.02806425366808843
+        },
+        {
+          "name": "normalization, position, and activation",
+          "median_us": 6437.164000089979,
+          "share": 0.6973531047118753
+        },
+        {
+          "name": "KV cache update",
+          "median_us": 323.3525003452087,
+          "share": 0.035029536303398064
+        }
+      ],
+      "source": {
+        "commit": "8265905d460fd3fb44ec1decb59950eccfe354e5",
+        "tree": "4f07753afccf9a487e3caa0ad7757501d9f377b3",
+        "tracked_dirty": true
+      },
+      "solution": "tiny_llm_ref",
+      "model": "Qwen/Qwen3-0.6B",
+      "software": {
+        "torch": "2.10.0+cu128",
+        "transformers": "4.57.6",
+        "python": "3.12.14"
+      },
+      "host": {
+        "machine": "x86_64",
+        "platform": "Linux-6.18.59-x86_64-with-glibc2.42",
+        "device": "NVIDIA GeForce RTX 5070 Ti",
+        "cuda": "12.8"
+      },
+      "warmup": 1,
+      "iterations": 2
+    },
+    {
+      "schema_version": 3,
+      "profile_kind": "public-operator-replay",
+      "checkpoint": "tiled-prefill",
+      "workload": {
+        "model": "Qwen/Qwen3-0.6B",
+        "phase": "prefill",
+        "tokens": 16,
+        "query_length": 16,
+        "position_offset": 0,
+        "request_bound": 16,
+        "prompt_rule": "seed-0-independent-operands-and-zero-token-ids",
+        "fixture_seed": 0,
+        "prefill_logits": "last",
+        "warmup": 1,
+        "iterations": 2,
+        "profile_kind": "public-operator-replay",
+        "adapter_version": 2,
+        "rope_offset_preparation": "once-per-pointwise-sample-inside-timing"
+      },
+      "workload_id": "9fe51cda920c9f75b0328d62ebac1e34416e1788639e258790647152398bab66",
+      "coverage": {
+        "complete": true
+      },
+      "shape": {
+        "layers": 28,
+        "hidden": 1024,
+        "intermediate": 3072,
+        "heads": 16,
+        "kv_heads": 8,
+        "head_dim": 128,
+        "vocab": 151936,
+        "dtype": "bfloat16"
+      },
+      "effective_features": {
+        "bounded_kv_capacity": true,
+        "quantized_weights": true,
+        "fast_rms_norm": true,
+        "fast_rope": true,
+        "fast_swiglu": true,
+        "simdgroup_matmul": true,
+        "tiled_prefill_attention": true,
+        "native_online_decode": false,
+        "fused_qk_norm_rope4": false,
+        "decode_submit18": false
+      },
+      "cache": {
+        "before_offset": 0,
+        "after_offset": 16,
+        "capacity": 16,
+        "request_bound": 16,
+        "first_update_from_empty": true,
+        "counter_kind": "nominal-python-accounting",
+        "counter_deltas": {
+          "logical_copy_bytes": 0,
+          "physical_growth_copy_bytes": 0,
+          "slice_write_bytes": 1835008,
+          "growth_copy_bytes": 0
+        }
+      },
+      "replay_total_us": 35885.02350066847,
+      "share_denominator": "sum-of-synchronized-public-group-medians",
+      "rope_offset_preparation": "once-per-pointwise-sample-inside-timing",
+      "categories": [
+        {
+          "name": "projections",
+          "median_us": 33530.90249947854,
+          "share": 0.9343982315868883
+        },
+        {
+          "name": "attention",
+          "median_us": 262.1114999783458,
+          "share": 0.007304203102262513
+        },
+        {
+          "name": "normalization, position, and activation",
+          "median_us": 1559.1355004289653,
+          "share": 0.04344808358283287
+        },
+        {
+          "name": "KV cache update",
+          "median_us": 532.8740007826127,
+          "share": 0.014849481728016322
+        }
+      ],
+      "source": {
+        "commit": "8265905d460fd3fb44ec1decb59950eccfe354e5",
+        "tree": "4f07753afccf9a487e3caa0ad7757501d9f377b3",
+        "tracked_dirty": true
+      },
+      "solution": "tiny_llm_ref",
+      "model": "Qwen/Qwen3-0.6B",
+      "software": {
+        "torch": "2.10.0+cu128",
+        "transformers": "4.57.6",
+        "python": "3.12.14"
+      },
+      "host": {
+        "machine": "x86_64",
+        "platform": "Linux-6.18.59-x86_64-with-glibc2.42",
+        "device": "NVIDIA GeForce RTX 5070 Ti",
+        "cuda": "12.8"
+      },
+      "warmup": 1,
+      "iterations": 2
+    },
+    {
+      "schema_version": 3,
+      "profile_kind": "public-operator-replay",
+      "checkpoint": "selected",
+      "workload": {
+        "model": "Qwen/Qwen3-0.6B",
+        "phase": "decode",
+        "tokens": 16,
+        "query_length": 1,
+        "position_offset": 15,
+        "request_bound": 16,
+        "prompt_rule": "seed-0-independent-operands-and-zero-token-ids",
+        "fixture_seed": 0,
+        "prefill_logits": "last",
+        "warmup": 1,
+        "iterations": 2,
+        "profile_kind": "public-operator-replay",
+        "adapter_version": 2,
+        "rope_offset_preparation": "once-per-pointwise-sample-inside-timing"
+      },
+      "workload_id": "f589f5e1b0057e99f4744147ed3e992f9a8b319dc063b964305430212c504798",
+      "coverage": {
+        "complete": false,
+        "reason": "reference-only selected scheduling has no complete public replay"
+      },
+      "categories": [],
+      "source": {
+        "commit": "8265905d460fd3fb44ec1decb59950eccfe354e5",
+        "tree": "4f07753afccf9a487e3caa0ad7757501d9f377b3",
+        "tracked_dirty": true
+      },
+      "solution": "tiny_llm_ref",
+      "model": "Qwen/Qwen3-0.6B",
+      "software": {
+        "torch": "2.10.0+cu128",
+        "transformers": "4.57.6",
+        "python": "3.12.14"
+      },
+      "host": {
+        "machine": "x86_64",
+        "platform": "Linux-6.18.59-x86_64-with-glibc2.42",
+        "device": "NVIDIA GeForce RTX 5070 Ti",
+        "cuda": "12.8"
+      },
+      "warmup": 1,
+      "iterations": 2
+    }
+  ]
+}

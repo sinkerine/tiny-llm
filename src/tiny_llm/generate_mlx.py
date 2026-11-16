@@ -1,7 +1,7 @@
 import mlx.core as mx
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 from .qwen3_week1 import Qwen3ModelWeek1
-from .qwen3_week2 import Qwen3ModelWeek2
+from .qwen3_week2_mlx import Qwen3ModelWeek2
 from typing import Callable
 
 

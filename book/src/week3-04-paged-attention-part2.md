@@ -227,11 +227,13 @@ silently fall back to dense attention.
 
 ### `src/tiny_llm/batch.py`
 
-The scheduler now needs to prepare runtime metadata instead of only dense K/V:
-
-- per-layer page tables for each active request
-- padded batch `block_table`
-- `context_lens`
+The scheduler does not build the metadata itself. A prefill call passes the
+request's own layer caches, and each `TinyKvPagedCache.update_and_fetch_paged`
+(from Day 3) returns that one request's metadata. A batched decode call passes
+the per-layer `BatchingKvCache`, whose `update_and_fetch_paged` returns the
+padded `block_table` and `context_lens` for every slot. The scheduler owns the
+request lifecycle around both: which slot each request occupies, and releasing
+every layer cache's pages when a request ends.
 
 This is where continuous batching and paged attention finally connect. On Day 1, batching worked by repacking tensors. Here, batching should work by reusing page tables and updating only the new slots.
 
@@ -272,25 +274,55 @@ These are the invariants worth checking in tests:
    course pool grows instead of reporting exhaustion, so that waste can force
    backing storage to grow and copy earlier, increasing memory pressure.
 
-## Task 1: Add Batch Metadata
+<a id="task-1-add-batch-metadata"></a>
+
+## Task 1: Check the Batch Metadata
 
 ```
 src/tiny_llm/paged_kv_cache.py
 src/tiny_llm/kv_cache.py
-src/tiny_llm/batch.py
 ```
 
-Modify `TinyKvPagedCache.block_table`, `context_lens`, `paged_metadata`, and
-`update_and_fetch_paged` in `src/tiny_llm/paged_kv_cache.py`. Then update
-`Request.try_prefill` and `_step` in `src/tiny_llm/batch.py` to carry those
-arrays for every active request.
+Day 4's attention reads the `block_table` and `context_lens` you already built
+on [Day 3](./week3-03-paged-attention-part1.md#batching-requests-with-pages):
+`TinyKvPagedCache.block_table`, `context_lens`, `paged_metadata` and
+`update_and_fetch_paged`, plus `BatchingKvCache.update_and_fetch_paged`. Task 1
+adds no new methods and no scheduler change. The metadata reaches attention
+through the model's cache call, which Task 3 wires up. Before writing the
+kernel, make sure those arrays hold exactly what it will read:
 
-Extend the batch cache and scheduler so they can prepare:
+- one row per decode slot, including idle ones;
+- an active row lists that request's page ids in logical order, padded with
+  `-1` up to the longest active request's page count;
+- an idle slot has `context_lens` 0 and a row of all `-1`;
+- each `context_lens` entry counts the request's written tokens, including the
+  chunk just appended.
 
-- `block_table`
-- `context_lens`
+Your Day 3 metadata check still applies. It builds two request caches, appends
+through `BatchingKvCache.update_and_fetch_paged`, and checks their
+`context_lens` and page-to-token mapping without calling `paged_attention`:
 
-for all active requests.
+```bash
+pdm run test --week 3 --day 3 -- -k task_3_model_request_caches_keep_independent_metadata
+```
+
+That is a prerequisite check on your Day 3 code. Both of its rows are active,
+so it does not cover the boundary Day 4's kernel depends on. This Day 4 check
+does: two active slots around an idle one, rows of different lengths, and the
+written length after a one-token append. It also checks the page tensors, page
+size and mask that `update_and_fetch_paged` returns. It does not call
+`paged_attention`, so run it before you write the kernel:
+
+```bash
+pdm run test --week 3 --day 4 -- -k task_1_batch_metadata
+```
+
+Day 4's other Task 1 test compares `paged_attention` with dense attention, so
+it turns green with Task 2:
+
+```bash
+pdm run test --week 3 --day 4 -- -k task_1
+```
 
 ## Task 2: Define `paged_attention`
 
@@ -374,6 +406,30 @@ require the quantized embedding, model dispatch, continuous batching, or the
 Day 5 kernel. Kernel names and implementation structure are not part of the
 test contract; only the public numerical, metadata, and dtype behavior is.
 
+`paged_attention` must also reject bad metadata with `ValueError` before it
+dispatches any kernel, because a kernel given a wrong page id reads another
+request's K/V or memory outside the pool. Check that:
+
+- `page_size` is positive;
+- every `context_lens` entry is nonnegative and fits in its row:
+  `ceil(context_len / page_size)` must not exceed the table width;
+- each of those live entries is a page id inside the page storage, and no live
+  page id appears twice anywhere in the table;
+- every entry after the live ones is exactly `-1`;
+- an active row (`context_len > 0`) holds at least as many tokens as the query
+  has rows, `L`.
+
+With the batch metadata from Task 1, run the remaining Task 2 checks, the
+metadata validation, and the Week 3 quantized embedding:
+
+```bash
+pdm run test --week 3 --day 4 -- -k task_2
+pdm run test --week 3 --day 4 -- -k rejects
+pdm run test --week 3 --day 4 -- -k custom_embedding
+```
+
+Rerun `-k task_1` from Task 1 now as well; it needs this operator.
+
 For the reference Qwen decode schedule, specialize BF16 `D = 128`: each lane owns
 four contiguous dimensions of Q, K, V, and the output. After all context
 positions are visited, transpose the 32 partial output vectors through one
@@ -430,6 +486,13 @@ Day 5 replaces the long-query schedule with paged FlashAttention without
 changing this model-facing policy. `--disable-paged-attention` is a Day 4
 dense-gather teaching ablation, not the completed serving path.
 
+This test decodes incrementally through the Week 3 model and compares each
+step with the Week 2 dense model:
+
+```bash
+pdm run test --week 3 --day 4 -- -k task_3
+```
+
 ## Task 4: Connect It to Continuous Batching
 
 ```
@@ -446,6 +509,14 @@ Update request admission, slot reuse, and request removal so that:
 - in this teaching implementation, that means freeing pages from every layer cache,
 - new requests allocate from the corresponding layer pool,
 - active decode steps reuse page metadata instead of rebuilding dense K/V.
+
+Day 4's tests do not exercise this scheduler wiring. To see it end to end,
+run the real model through your paged scheduler and watch requests enter,
+decode, finish, and free their slots:
+
+```bash
+pdm run batch-main --solution tiny_llm --loader week3
+```
 
 After this chapter, the serving stack has the right structure for a real high-throughput runtime: paging is no longer just a storage trick, but part of the execution model itself.
 

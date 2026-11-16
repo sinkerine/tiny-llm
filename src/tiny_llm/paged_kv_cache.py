@@ -3,7 +3,7 @@ from typing import Optional
 
 import mlx.core as mx
 
-from .kv_cache import TinyKvCache
+from .kv_cache_mlx import TinyKvCache
 
 
 @dataclass

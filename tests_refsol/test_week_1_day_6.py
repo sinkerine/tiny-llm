@@ -14,6 +14,10 @@ class FakeTokenizer:
     def decode(self, tokens, **kwargs):
         return "".join({2: "A", 3: "B", 4: "C"}.get(int(t), "") for t in tokens)
 
+    # TokenizerWrapper inspects this method even for plain-text generation.
+    def apply_chat_template(self, *args, **kwargs):
+        raise NotImplementedError("This test tokenizer only supports plain text.")
+
 
 class ScriptedModel:
     def __init__(self, tokens, device):

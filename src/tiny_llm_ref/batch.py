@@ -2,7 +2,7 @@ import mlx.core as mx
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 from datetime import datetime
 
-from .kv_cache import BatchingKvCache
+from .kv_cache_mlx import BatchingKvCache
 
 
 def _step(model, y, offsets, kv_cache):

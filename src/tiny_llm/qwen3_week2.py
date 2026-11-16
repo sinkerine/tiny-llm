@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
-import mlx.core as mx
+import torch
 
 from .embedding import Embedding  # noqa: F401 - learner checkpoint dependency
 from .kv_cache import TinyKvCache
@@ -89,12 +89,12 @@ class Qwen3MultiHeadAttention:
         num_heads: int,
         num_kv_heads: int,
         head_dim: int,
-        wq: mx.array | QuantizedWeights,
-        wk: mx.array | QuantizedWeights,
-        wv: mx.array | QuantizedWeights,
-        wo: mx.array | QuantizedWeights,
-        q_norm: mx.array,
-        k_norm: mx.array,
+        wq: torch.Tensor | QuantizedWeights,
+        wk: torch.Tensor | QuantizedWeights,
+        wv: torch.Tensor | QuantizedWeights,
+        wo: torch.Tensor | QuantizedWeights,
+        q_norm: torch.Tensor,
+        k_norm: torch.Tensor,
         max_seq_len: int = 32768,
         theta: int = 1000000,
         rms_norm_eps: float = 1e-5,
@@ -106,11 +106,11 @@ class Qwen3MultiHeadAttention:
 
     def __call__(
         self,
-        x: mx.array,
-        offsets: int | list[int] | mx.array,
+        x: torch.Tensor,
+        offsets: int | list[int] | torch.Tensor,
         cache: TinyKvCache,
-        mask: mx.array | str | None = None,
-    ) -> mx.array:
+        mask: torch.Tensor | str | None = None,
+    ) -> torch.Tensor:
         pass
 
 
@@ -119,14 +119,14 @@ class Qwen3MLP:
         self,
         dim: int,
         hidden_dim: int,
-        w_gate: mx.array | QuantizedWeights,
-        w_up: mx.array | QuantizedWeights,
-        w_down: mx.array | QuantizedWeights,
+        w_gate: torch.Tensor | QuantizedWeights,
+        w_up: torch.Tensor | QuantizedWeights,
+        w_down: torch.Tensor | QuantizedWeights,
         use_fast_swiglu: bool = True,
     ):
         pass
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
         pass
 
 
@@ -139,17 +139,17 @@ class Qwen3TransformerBlock:
         head_dim: int,
         intermediate_size: int,
         rms_norm_eps: float,
-        wq: mx.array | QuantizedWeights,
-        wk: mx.array | QuantizedWeights,
-        wv: mx.array | QuantizedWeights,
-        wo: mx.array | QuantizedWeights,
-        q_norm: mx.array,
-        k_norm: mx.array,
-        w_gate: mx.array | QuantizedWeights,
-        w_up: mx.array | QuantizedWeights,
-        w_down: mx.array | QuantizedWeights,
-        w_input_layernorm: mx.array,
-        w_post_attention_layernorm: mx.array,
+        wq: torch.Tensor | QuantizedWeights,
+        wk: torch.Tensor | QuantizedWeights,
+        wv: torch.Tensor | QuantizedWeights,
+        wo: torch.Tensor | QuantizedWeights,
+        q_norm: torch.Tensor,
+        k_norm: torch.Tensor,
+        w_gate: torch.Tensor | QuantizedWeights,
+        w_up: torch.Tensor | QuantizedWeights,
+        w_down: torch.Tensor | QuantizedWeights,
+        w_input_layernorm: torch.Tensor,
+        w_post_attention_layernorm: torch.Tensor,
         max_seq_len: int = 32768,
         theta: int = 1000000,
         use_fast_rms_norm: bool = True,
@@ -161,25 +161,25 @@ class Qwen3TransformerBlock:
 
     def __call__(
         self,
-        x: mx.array,
+        x: torch.Tensor,
         offset: int,
         cache: TinyKvCache,
-        mask: mx.array | str | None = None,
-    ) -> mx.array:
+        mask: torch.Tensor | str | None = None,
+    ) -> torch.Tensor:
         pass
 
 
 class Qwen3ModelWeek2:
     def __init__(
         self,
-        mlx_model: Any,
+        hf_model: Any,
         checkpoint: str = "selected",
-        use_mlx_quantized_linear: bool = False,
+        use_torch_quantized_linear: bool = False,
         use_bounded_kv_capacity: bool | None = None,
         use_register_cached_rms_norm: bool | None = None,
         use_tiled_prefill_attention: bool | None = None,
     ):
-        self.num_hidden_layers = mlx_model.args.num_hidden_layers
+        self.num_hidden_layers = hf_model.config.num_hidden_layers
         pass
 
     def create_kv_cache(self, capacity: int | None = None) -> list[TinyKvCache]:
@@ -187,9 +187,9 @@ class Qwen3ModelWeek2:
 
     def __call__(
         self,
-        inputs: mx.array,
+        inputs: torch.Tensor,
         offset: int,
         cache: list[TinyKvCache],
         logits_to_keep: int | None = None,
-    ) -> mx.array:
+    ) -> torch.Tensor:
         pass

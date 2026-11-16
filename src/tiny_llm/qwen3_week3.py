@@ -1,8 +1,8 @@
 import mlx.core as mx
 from typing import Any
-from .kv_cache import TinyKvCache
+from .kv_cache_mlx import TinyKvCache
 from .moe import Moe
-from .quantize import QuantizedWeights
+from .quantize_mlx import QuantizedWeights
 
 
 class Qwen3MultiHeadAttention:

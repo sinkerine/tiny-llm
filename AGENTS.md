@@ -12,7 +12,7 @@
 
 ## Environment Requirements
 
-- This branch targets Linux/CUDA for Week 1; see `CUDA.md`.
+- This branch targets Linux/CUDA for Weeks 1–2; see `CUDA.md`.
 - Keep all student exercises unfinished. Port existing reference solutions only.
 - Enter `nix develop` (or use direnv), then install dependencies:
 
@@ -21,7 +21,23 @@ uv sync --locked
 pdm run check-installation
 ```
 
-- Weeks 2–4 retain MLX/Metal and are outside the CUDA test scope.
+- Weeks 3–4 retain MLX/Metal and are outside the CUDA test scope.
+- Week 2 uses PyTorch and native C++/CUDA extensions. Day 1 needs no native build.
+- Before native Day 2–5 tests, run `nix develop --command pdm run build-ext-ref`
+  for reference checks and `pdm run build-ext` for learner checks. The latter
+  builds fail-closed learner stubs until the student implements them.
+- CUDA extension builds use one compiler worker by default and store outputs at
+  `${XDG_CACHE_HOME:-$HOME/.cache}/dev-scratch/tiny-llm/cuda-week2/{reference,student}/`.
+  Rebuild and cleanup use these same directories; never delete them during an active build.
+- Active Week 2 measurements use `pdm run bench-week2-cuda` (request time and
+  per-request peak allocated CUDA bytes) and `pdm run profile-week2-kernels`
+  (public operator replay). Reference `selected` extra scheduling has incomplete
+  public replay coverage; use actual model traces instead of attributing it to
+  teaching operators. Older MLX capture entrypoints remain historical.
+- Include `tests_refsol/test_week_2_reference_runtime.py` in reference runtime
+  checks after changing selected scheduling. These are reference-only controls,
+  not additional learner exercises. CUDA launches eagerly; do not copy MLX
+  graph-rewrite or submit-at-layer-18 flush mechanisms into the CUDA runtime.
 
 - Optional baseline check from the setup chapter (reference solution, Week 1):
 
@@ -69,7 +85,8 @@ pdm run test-refsol --week 2 --day 3 -- -k task_3
 
 Rebuild before tests if these changed:
 
-- `src/extensions/src/*`
+- `src/cuda/*` (active Week 2 CUDA kernels/bindings)
+- `src/extensions/src/*` (historical Metal only)
 
 Commands:
 

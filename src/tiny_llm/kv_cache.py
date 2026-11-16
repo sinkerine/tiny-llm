@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
-import mlx.core as mx
+import torch
 
 if TYPE_CHECKING:
     from .paged_kv_cache import PagedKvMetadata
@@ -11,11 +11,11 @@ class TinyKvCache(ABC):
     @abstractmethod
     def update_and_fetch(
         self,
-        key: mx.array,
-        value: mx.array,
+        key: torch.Tensor,
+        value: torch.Tensor,
         mask_length: int | None = None,
-        mask: mx.array | str | None = None,
-    ) -> tuple[mx.array, mx.array, int, Optional[mx.array]]:
+        mask: torch.Tensor | str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, int, Optional[torch.Tensor]]:
         """
         Update the key-value cache and fetch the updated key-value cache.
 
@@ -40,10 +40,10 @@ class TinyKvCache(ABC):
 
     def update_and_fetch_paged(
         self,
-        key: mx.array,
-        value: mx.array,
+        key: torch.Tensor,
+        value: torch.Tensor,
         mask_length: int | None = None,
-        mask: mx.array | str | None = None,
+        mask: torch.Tensor | str | None = None,
     ) -> "PagedKvMetadata":
         pass
 
@@ -58,19 +58,19 @@ class BatchingKvCache(TinyKvCache):
 
     def update_and_fetch(
         self,
-        keys: mx.array,
-        values: mx.array,
+        keys: torch.Tensor,
+        values: torch.Tensor,
         mask_length: int | None = None,
-        mask: mx.array | str | None = None,
-    ) -> tuple[mx.array, mx.array, int, Optional[mx.array]]:
+        mask: torch.Tensor | str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, int, Optional[torch.Tensor]]:
         pass
 
     def update_and_fetch_paged(
         self,
-        keys: mx.array,
-        values: mx.array,
+        keys: torch.Tensor,
+        values: torch.Tensor,
         mask_length: int | None = None,
-        mask: mx.array | str | None = None,
+        mask: torch.Tensor | str | None = None,
     ) -> "PagedKvMetadata":
         pass
 
@@ -99,17 +99,17 @@ class TinyKvFullCache(TinyKvCache):
     def uses_capacity(self) -> bool:
         return self.capacity is not None
 
-    def _logical_key_values(self) -> tuple[mx.array, mx.array]:
+    def _logical_key_values(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return only initialized tokens, never the unused physical tail."""
         pass
 
     def update_and_fetch(
         self,
-        key: mx.array,
-        value: mx.array,
+        key: torch.Tensor,
+        value: torch.Tensor,
         mask_length: int | None = None,
-        mask: mx.array | str | None = None,
-    ) -> tuple[mx.array, mx.array, int, Optional[mx.array]]:
+        mask: torch.Tensor | str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, int, Optional[torch.Tensor]]:
         pass
 
     def materialize(self):

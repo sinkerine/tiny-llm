@@ -1,0 +1,22 @@
+warning: Git tree '/home/sinkerine/dev/tiny-llm' is dirty
+........................................................................ [  9%]
+........................................................................ [ 19%]
+........................................................................ [ 29%]
+.........................................ss............................. [ 38%]
+........................................................................ [ 48%]
+........................................................................ [ 58%]
+........................................................................ [ 67%]
+........................................................................ [ 77%]
+....................................ss.................................. [ 87%]
+....................................................... [ 94%]
+........................................                                 [100%]
+=============================== warnings summary ===============================
+../../../../nix/store/rk9v5yral1fsx8r73j7k0z4wkhlhhgz8-python3.14-anyio-4.14.2/lib/python3.14/site-packages/anyio/pytest_plugin.py:14
+  /nix/store/rk9v5yral1fsx8r73j7k0z4wkhlhhgz8-python3.14-anyio-4.14.2/lib/python3.14/site-packages/anyio/pytest_plugin.py:14: PytestRemovedIn10Warning: _pytest.python.CallSpec2 has been renamed to CallSpec.
+  The CallSpec2 alias will be removed in pytest 10.
+  Update imports to use CallSpec instead.
+  See https://docs.pytest.org/en/stable/deprecations.html#callspec2-renamed
+    from _pytest.python import CallSpec2
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+739 passed, 4 skipped, 1 warning, 17 subtests passed in 6.23s

@@ -1,107 +1,115 @@
-from typing import Any
+"""Group-affine W4 storage and native CUDA projection dispatch."""
 
-import mlx.core as mx
+from dataclasses import dataclass
+import torch
+from . import cuda_ops
 
-from extensions_ref import tiny_llm_ext_ref
+
+from tiny_llm_cuda.packing import pack_weights
 
 
+@dataclass
 class QuantizedWeights:
-    def __init__(
-        self,
-        scales: mx.array,
-        biases: mx.array,
-        group_size: int,
-        bits: int,
-        weight: mx.array,
-        use_simdgroup_matmul: bool = False,
-        use_simdgroup_matvec: bool = True,
-        use_split_k_matmul: bool = False,
-        use_mlx_quantized_linear: bool = False,
-    ):
-        self.scales = scales
-        self.biases = biases
-        self.group_size = group_size
-        self.bits = bits
-        self.weight = weight
-        self.use_simdgroup_matmul = use_simdgroup_matmul
-        self.use_simdgroup_matvec = use_simdgroup_matvec
-        self.use_split_k_matmul = use_split_k_matmul
-        self.use_mlx_quantized_linear = use_mlx_quantized_linear
+    scales: torch.Tensor
+    biases: torch.Tensor
+    group_size: int
+    bits: int
+    weight: torch.Tensor
+    use_simdgroup_matmul: bool = False
+    use_simdgroup_matvec: bool = True
+    use_split_k_matmul: bool = False
+    use_torch_quantized_linear: bool = False
 
     @staticmethod
-    def from_mlx_layer(
-        mlx_layer: Any,
-        use_simdgroup_matmul: bool = False,
-        use_simdgroup_matvec: bool = True,
-        use_split_k_matmul: bool = False,
-        use_mlx_quantized_linear: bool = False,
-    ) -> "QuantizedWeights":
-        biases = mlx_layer.biases
-        return QuantizedWeights(
-            scales=mlx_layer.scales.astype(mx.bfloat16),
-            biases=None if biases is None else biases.astype(mx.bfloat16),
-            group_size=mlx_layer.group_size,
-            bits=mlx_layer.bits,
-            weight=mlx_layer.weight,
-            use_simdgroup_matmul=use_simdgroup_matmul,
-            use_simdgroup_matvec=use_simdgroup_matvec,
-            use_split_k_matmul=use_split_k_matmul,
-            use_mlx_quantized_linear=use_mlx_quantized_linear,
-        )
+    def from_layer(layer, **kwargs):
+        packed, scales, biases = pack_weights(layer.weight)
+        return QuantizedWeights(scales, biases, 128, 4, packed, **kwargs)
 
 
-def mlx_quantized_linear(
-    x: mx.array,
-    w: QuantizedWeights,
-    bias: mx.array | None = None,
-) -> mx.array:
-    result = mx.quantized_matmul(
-        x,
-        w.weight,
-        scales=w.scales,
-        biases=w.biases,
-        transpose=True,
-        group_size=w.group_size,
-        bits=w.bits,
+def dequantize_weights(weight, scales, biases, group_size, bits):
+    if (
+        bits != 4
+        or group_size <= 0
+        or weight.shape[-1] * 8 != scales.shape[-1] * group_size
+    ):
+        raise ValueError("incompatible packed W4 layout")
+    shifts = torch.arange(0, 32, 4, device=weight.device)
+    q = (
+        ((weight.long()[..., None] >> shifts) & 15)
+        .reshape(*weight.shape[:-1], -1)
+        .float()
     )
+    scale = scales.repeat_interleave(group_size, -1).float()
+    result = q * scale
+    if biases is not None:
+        result = result + biases.repeat_interleave(group_size, -1).float()
+    return result.to(scales.dtype)
+
+
+def dequantize_linear(layer):
+    return layer.weight.detach()
+
+
+def torch_quantized_linear(x, w, bias=None):
+    dense = dequantize_weights(w.weight, w.scales, w.biases, w.group_size, w.bits)
+    result = torch.nn.functional.linear(x, dense)
     return result if bias is None else result + bias
 
 
-def quantized_linear(
-    x: mx.array,
-    w: QuantizedWeights,
-    bias: mx.array | None = None,
-) -> mx.array:
-    if w.use_mlx_quantized_linear:
-        return mlx_quantized_linear(x, w, bias)
-    rows = 1
-    for size in x.shape[:-1]:
-        rows *= size
-    operation = (
-        quantized_matvec_custom
-        if rows <= 8 and w.use_simdgroup_matvec
-        else quantized_matmul
+def quantized_matmul(
+    scales,
+    biases,
+    group_size,
+    bits,
+    a,
+    b,
+    transpose_b=False,
+    use_simdgroup=False,
+    use_split_k=False,
+):
+    if bits != 4 or not transpose_b or use_split_k:
+        raise ValueError(
+            "CUDA Week 2 supports W4, transpose_b=True, and no historical Split-K"
+        )
+    return cuda_ops.w4(
+        a.contiguous(),
+        b.contiguous(),
+        scales.contiguous(),
+        biases.contiguous(),
+        group_size,
+        2 if use_simdgroup else 0,
     )
-    kwargs = {}
-    if operation is quantized_matmul:
-        kwargs["use_simdgroup"] = w.use_simdgroup_matmul
-        kwargs["use_split_k"] = w.use_split_k_matmul
-    if bias is not None:
-        return (
-            operation(
-                w.scales,
-                w.biases,
-                w.group_size,
-                w.bits,
-                x,
-                w.weight,
-                True,
-                **kwargs,
-            )
-            + bias
+
+
+def quantized_matvec_custom(scales, biases, group_size, bits, a, b, transpose_b=False):
+    if a.numel() // a.shape[-1] > 8:
+        raise ValueError("quantized_matvec_custom supports at most 8 rows")
+    if bits != 4 or not transpose_b:
+        raise ValueError("CUDA matvec requires W4 and transpose_b=True")
+    return cuda_ops.w4(
+        a.contiguous(),
+        b.contiguous(),
+        scales.contiguous(),
+        biases.contiguous(),
+        group_size,
+        1,
+    )
+
+
+def quantized_matmul_vanilla(scales, biases, group_size, bits, a, b, transpose_b=False):
+    return quantized_matmul(scales, biases, group_size, bits, a, b, transpose_b)
+
+
+def quantized_linear(x, w, bias=None):
+    if w.use_torch_quantized_linear:
+        return torch_quantized_linear(x, w, bias)
+    rows = x.numel() // x.shape[-1]
+    if rows <= 8 and w.use_simdgroup_matvec:
+        result = quantized_matvec_custom(
+            w.scales, w.biases, w.group_size, w.bits, x, w.weight, True
         )
     else:
-        return operation(
+        result = quantized_matmul(
             w.scales,
             w.biases,
             w.group_size,
@@ -109,109 +117,7 @@ def quantized_linear(
             x,
             w.weight,
             True,
-            **kwargs,
+            w.use_simdgroup_matmul,
+            w.use_split_k_matmul,
         )
-
-
-def dequantize_linear(mx_layer: Any) -> mx.array:
-    return mx.dequantize(
-        mx_layer.weight,
-        mx_layer.scales,
-        mx_layer.biases,
-        mx_layer.group_size,
-        mx_layer.bits,
-    ).astype(mx.bfloat16)
-
-
-def dequantize_weights(
-    weight: mx.array,
-    scales: mx.array,
-    biases: mx.array | None,
-    group_size: int,
-    bits: int,
-) -> mx.array:
-    if bits <= 0 or 32 % bits != 0:
-        raise ValueError("bits must divide a 32-bit packed weight")
-    values_per_word = 32 // bits
-    shifts = mx.arange(0, 32, bits, dtype=mx.uint32)
-    values = (weight[..., None] >> shifts) & ((1 << bits) - 1)
-    values = values.reshape(*weight.shape[:-1], weight.shape[-1] * values_per_word)
-    values = values.astype(mx.float32)
-    expanded_scales = mx.repeat(scales, group_size, axis=-1).astype(mx.float32)
-    if biases is None:
-        return (values * expanded_scales).astype(scales.dtype)
-    expanded_biases = mx.repeat(biases, group_size, axis=-1).astype(mx.float32)
-    return (values * expanded_scales + expanded_biases).astype(scales.dtype)
-
-
-def quantized_matmul(
-    scales: mx.array,
-    biases: mx.array,
-    group_size: int,
-    bits: int,
-    a: mx.array,
-    b: mx.array,
-    transpose_b: bool = False,
-    use_simdgroup: bool = False,
-    use_split_k: bool = False,
-) -> mx.array:
-    *N, D = a.shape
-    a = a.reshape(-1, D)
-    result = tiny_llm_ext_ref.quantized_matmul(
-        mx.contiguous(scales),
-        mx.contiguous(biases),
-        group_size,
-        bits,
-        mx.contiguous(a),
-        mx.contiguous(b),
-        transpose_b,
-        use_simdgroup,
-        use_split_k,
-    )
-    return result.reshape(*N, -1)
-
-
-def quantized_matvec_custom(
-    scales: mx.array,
-    biases: mx.array,
-    group_size: int,
-    bits: int,
-    a: mx.array,
-    b: mx.array,
-    transpose_b: bool = False,
-) -> mx.array:
-    *N, D = a.shape
-    a = a.reshape(-1, D)
-    if a.shape[0] > 8:
-        raise ValueError("quantized_matvec_custom supports at most 8 input rows")
-    result = tiny_llm_ext_ref.quantized_matmul(
-        mx.contiguous(scales),
-        mx.contiguous(biases),
-        group_size,
-        bits,
-        mx.contiguous(a),
-        mx.contiguous(b),
-        transpose_b,
-    )
-    return result.reshape(*N, -1)
-
-
-def quantized_matmul_vanilla(
-    scales: mx.array,
-    biases: mx.array,
-    group_size: int,
-    bits: int,
-    a: mx.array,
-    b: mx.array,
-    transpose_b: bool = False,
-) -> mx.array:
-    return quantized_matmul(
-        scales,
-        biases,
-        group_size,
-        bits,
-        a,
-        b,
-        transpose_b,
-        use_simdgroup=False,
-    )
+    return result if bias is None else result + bias

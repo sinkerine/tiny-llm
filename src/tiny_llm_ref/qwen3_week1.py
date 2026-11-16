@@ -1,6 +1,5 @@
 import torch
 from .basics import linear, silu
-from .attention import scaled_dot_product_attention_grouped
 from .layer_norm import RMSNorm
 from .positional_encoding import RoPE
 from typing import Any
@@ -66,13 +65,15 @@ class Qwen3MultiHeadAttention:
         projection_q = projection_q.permute(0, 2, 1, 3)
         projection_k = projection_k.permute(0, 2, 1, 3)
         projection_v = projection_v.permute(0, 2, 1, 3)
-        x = scaled_dot_product_attention_grouped(
-            projection_q.to(torch.float32),
-            projection_k.to(torch.float32),
-            projection_v.to(torch.float32),
+        x = torch.nn.functional.scaled_dot_product_attention(
+            projection_q,
+            projection_k,
+            projection_v,
+            attn_mask=mask if isinstance(mask, torch.Tensor) else None,
+            is_causal=isinstance(mask, str) and mask == "causal",
             scale=self.scale,
-            mask=mask,
-        ).to(x.dtype)
+            enable_gqa=True,
+        )
         x = x.permute(0, 2, 1, 3).reshape(B, L, self.num_heads * self.head_dim)
         return linear(x, self.wo)
 

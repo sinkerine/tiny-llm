@@ -1,9 +1,10 @@
-# Week 1 on CUDA
+# Weeks 1–2 on CUDA
 
-Week 1 uses PyTorch tensors on Linux with an NVIDIA GPU. Student tasks in
-`src/tiny_llm` remain exercises; completed implementations are in
-`src/tiny_llm_ref`. Weeks 2–4 still contain MLX/Metal code and are outside this
-CUDA port. They are not imported by the Week 1 packages.
+Weeks 1–2 use PyTorch tensors on Linux with an NVIDIA GPU. Student tasks in
+`src/tiny_llm` remain exercises; completed reference implementations are in
+`src/tiny_llm_ref`. Week 2 uses native C++/CUDA kernels. Weeks 3–4 remain
+historical MLX/Metal routes and are outside this port. CUDA package imports
+do not import MLX or eagerly build native extensions.
 
 ## Environment
 
@@ -105,6 +106,78 @@ The CLI downloads the requested model if necessary. Add `--device cpu` for
 CPU execution. `simple_generate` uses Transformers' `TextStreamer` and accepts
 a Hugging Face tokenizer; sampling returns `torch.long` token IDs.
 
-The original CLI for later weeks is retained in `scripts/main_mlx.py` and is
-selected by `main.py --loader week2` or `--loader week3`. Those weeks require
-the original Apple/MLX dependencies and extensions in a separate environment.
+## Week 2 native kernels
+
+Week 2 Day 1 runs without native extensions. Days 2–5 require BF16 tensor-core
+support (compute capability 8.0+) and the supplied CUDA toolkit, host C++ compiler,
+Ninja, and PyTorch development headers. The tested shell builds with CUDA 13
+and the pinned PyTorch CUDA 12.8 wheels. This combination was verified on the
+local RTX 5070 Ti; other toolkit/driver combinations need their own validation.
+No Xcode, Metal, MLX or Triton dependency is needed.
+
+```sh
+nix develop --command pdm run build-ext-ref
+nix develop --command pdm run build-ext
+nix develop --command pdm run build-ext-test
+nix develop --command pdm run test-refsol --week 2 --day 1 -- -q
+# Repeat reference checks for Days 2–5 after the native build.
+```
+
+`src/cuda/bindings.cpp` exposes separate learner/reference implementations
+from `student.cu` and `reference.cu`. Learner stubs raise errors until implemented.
+`build-ext-test` checks that their bindings load, without claiming unfinished
+kernels are correct. Python wrappers validate shapes, dtypes and devices.
+Native launches use PyTorch's current CUDA stream and device guard.
+
+Build outputs live under
+`${XDG_CACHE_HOME:-$HOME/.cache}/dev-scratch/tiny-llm/cuda-week2/reference/`
+and the sibling `student/` directory. `MAX_JOBS` defaults to 1. PyTorch selects
+the visible GPU architecture; `TORCH_CUDA_ARCH_LIST` can select another supported
+target explicitly. To clean/rebuild, first verify no process uses the relevant
+build directory, then remove only that directory and rerun its build command.
+Keep source files and diagnostic reports outside this disposable cache.
+
+Day 2 packs Hugging Face BF16 weights into int32 W4 words with BF16 scale/bias
+per group of 128. The reference custom operators unpack inside CUDA; only the
+explicit readable PyTorch control dequantizes full matrices. Day 3 uses WMMA
+16x16 tensor-core tiles. Day 4 adds RMSNorm, RoPE and SwiGLU kernels. Day 5 uses
+BQ4/BK16 shared-memory online-softmax attention with BF16/D128, GQA and masks.
+Short-query decode retains PyTorch attention in teaching `tiled-prefill`.
+Reference `selected` additionally uses stride-aware native online decode,
+256-token split partitions (with stable merging and zero fully masked rows),
+long-context GQA4 tile sharing, and guarded explicit Q/K RMSNorm–RoPE fusion.
+The fusion acts on raw activations because PyTorch tensors are already materialized;
+`_qk_norm_rope4` on normalized tensors preserves the ordinary RoPE fallback.
+`use_native_online_decode=False` and `use_fused_qk_norm_rope4=False` disable
+these reference controls. Upstream's MLX `submit18` flush is inapplicable:
+CUDA launches eagerly; `use_decode_submit18=True` is rejected rather than
+introducing a synchronization at layer 18. These educational kernels have
+no guaranteed latency advantage over optimized libraries.
+
+```sh
+HF_HUB_OFFLINE=1 nix develop --command pdm run main --loader week2 \
+  --solution tiny_llm_ref --week2-checkpoint selected \
+  --model Qwen/Qwen3-0.6B --max-tokens 32
+nix develop --command pdm run bench-week2-cuda --solution tiny_llm_ref \
+  --checkpoint kv-cache --checkpoint capacity-cache --checkpoint selected \
+  --prefill-tokens 128 --decode-tokens 16 --prefill-logits all --repeats 3
+```
+
+The CUDA benchmark uses cached weights, warmup, fresh request caches and explicit
+CUDA synchronization. It also records full request wall time and per-request
+PyTorch CUDA allocator peak allocated bytes, resetting peaks after warmup and
+before each request. The scope includes resident source HF and active model
+tensors; it is not incremental memory, reserved bytes, or physical GPU usage. `--profile /tmp/week2.json` exports per-checkpoint traces.
+`all` is the matched full-logit comparison with Week 1; `last` reduces Week 2
+prefill projection work and should be reported separately. Results are JSON lines
+on stdout; redirect to a durable report when needed. `pdm run profile-week2-kernels` now runs upstream's public-operator replay
+contract on CUDA, with synchronized group medians, cache counters, workload and
+source identities, and optional decision records. Reference `selected` reports
+incomplete public replay coverage because its extra scheduling is not represented
+by those teaching operators. See [the profiling chapter](book/src/week2-profile-guided.md).
+Historical MLX capture/private Apple decoder scripts remain separate;
+`source-costs-week2-metal` is an optional macOS-only tool.
+
+The original Apple CLI remains in `scripts/main_mlx.py`. `main.py --loader week3`
+selects it; Week 3 still requires its original dependencies in a separate environment.
+Preserved `*_mlx.py` Week 2 modules support that historical backend.

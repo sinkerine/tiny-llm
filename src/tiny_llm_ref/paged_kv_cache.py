@@ -5,7 +5,7 @@ import mlx.core as mx
 
 from extensions_ref import tiny_llm_ext_ref
 
-from .kv_cache import TinyKvCache
+from .kv_cache_mlx import TinyKvCache
 
 
 @dataclass

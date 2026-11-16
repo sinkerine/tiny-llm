@@ -54,8 +54,8 @@ class RoPE:
             x1 = x[..., 0 : self.half_dims]
             x2 = x[..., self.half_dims : self.dims]
         # reshape basis: (1, s, 1, dims // 2, 2)
-        cos_basis = cos_basis.reshape(-1, S, 1, self.half_dims)
-        sin_basis = sin_basis.reshape(-1, S, 1, self.half_dims)
+        cos_basis = cos_basis.reshape(-1, S, 1, self.half_dims).to(x.dtype)
+        sin_basis = sin_basis.reshape(-1, S, 1, self.half_dims).to(x.dtype)
         # manually doing complex number multiplication..
         real = torch.mul(x1, cos_basis) - torch.mul(x2, sin_basis)
         imag = torch.mul(x2, cos_basis) + torch.mul(x1, sin_basis)

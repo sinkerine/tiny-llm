@@ -5,7 +5,7 @@
 The Week 1 model can now produce normalized log probabilities and generate a
 greedy response. Today you will complete its single-request sampling path, run
 that path in the full Qwen3 loop, and prepare the tools needed for Week 2's
-custom Metal extensions.
+native CUDA extensions.
 
 ## Task 1: Sampling
 
@@ -81,21 +81,37 @@ After the focused checkpoint passes, verify the completed sampler in the full
 Week 1 product loop:
 
 ```bash
-pdm run main --solution tiny_llm --loader week1 --model qwen3-0.6b --sampler-temp 0.5
-pdm run main --solution tiny_llm --loader week1 --model qwen3-0.6b --sampler-temp 0.5 --sampler-top-k 10
-pdm run main --solution tiny_llm --loader week1 --model qwen3-0.6b --sampler-temp 0.5 --sampler-top-p 0.9
+pdm run main --solution tiny_llm --loader week1 --model Qwen/Qwen3-0.6B --temperature 0.5 --top-k 0 --top-p 0
+pdm run main --solution tiny_llm --loader week1 --model Qwen/Qwen3-0.6B --temperature 0.5 --top-k 10 --top-p 0
+pdm run main --solution tiny_llm --loader week1 --model Qwen/Qwen3-0.6B --temperature 0.5 --top-k 0 --top-p 0.9
 ```
 
 These commands require the cached 0.6B model. If it is missing, download it and
 rerun them:
 
 ```bash
-hf download Qwen/Qwen3-0.6B
+hf download Qwen/Qwen3-0.6B --cache-dir ~/.cache/tiny-llm
 ```
 
 Larger models remain optional and are not a Day 7 completion gate.
 
 ## Task 2: Prepare for Week 2
+
+The active Linux route uses PyTorch and C++/CUDA. Stay in the same Nix shell:
+
+```bash
+nix develop --command pdm run build-ext
+nix develop --command pdm run build-ext-ref
+nix develop --command pdm run build-ext-test
+```
+
+The learner build loads bindings while retaining unfinished kernel stubs.
+The reference build provides working controls. Day 1's Python KV-cache tests
+need neither build; native kernels begin on Day 2. See [CUDA setup](../../CUDA.md)
+for build caches and GPU requirements, then continue to
+[Week 2 Day 1](./week2-01-kv-cache.md).
+
+## Historical macOS Preparation (Not Required for CUDA)
 
 Day 1's KV-cache implementation is in Python, but its supplied tests import
 the Week 2 native extension when they collect. Prepare and build that extension
@@ -187,8 +203,8 @@ custom-kernel lessons. For example, implement element-wise operations such as
 operations in your model implementation.
 
 That completes Week 1: you now have a single-request Python inference loop that
-loads Qwen3, computes logits, samples tokens, and streams a response. Week 2
-first adds KV caching in Python with the extension built for test collection.
-The custom Metal kernel path follows in a later release.
+loads Qwen3, computes logits, samples tokens, and streams a response. The active
+CUDA Week 2 route starts with Python KV caching, then native packed-weight and
+fused kernels. The macOS instructions above are historical supplemental material.
 
 {{#include copyright.md}}

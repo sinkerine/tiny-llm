@@ -5,6 +5,19 @@
 This week, we will start with basic array and matrix operations and use them to turn Qwen3 model parameters into a model
 that generates text. We will implement the neural network layers used by Qwen3 with PyTorch tensor operations on CUDA.
 
+## Where You Start
+
+After [setup](./setup.md), run the reference model and watch it generate text.
+Your package, `src/tiny_llm`, has matching interfaces and unfinished exercise
+bodies. Fill them in day by day and run `pdm run test --week 1 --day N`.
+Existing completed student work remains yours; a reference pass does not complete a task.
+
+Days 1–4 build the layers, Day 5 assembles Qwen3 from Hugging Face weights,
+and Day 6 adds generation. Day 7 adds sampling and prepares the native CUDA
+toolchain for Week 2. Start with [Day 1](./week1-01-attention.md).
+
+## Model and Precision
+
 We will use `Qwen/Qwen3-0.6B`. The course model uses BF16 weights and
 activations by default, so start with the 0.6B model before trying larger Qwen3
 models. The required model path runs on the GPU. Small operator fixtures may
