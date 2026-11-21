@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -15,7 +15,7 @@ class TinyKvCache(ABC):
         value: torch.Tensor,
         mask_length: int | None = None,
         mask: torch.Tensor | str | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, int, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor | str | None]:
         """
         Update the key-value cache and fetch the updated key-value cache.
 
@@ -62,7 +62,7 @@ class BatchingKvCache(TinyKvCache):
         values: torch.Tensor,
         mask_length: int | None = None,
         mask: torch.Tensor | str | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, int, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor | str | None]:
         pass
 
     def update_and_fetch_paged(
@@ -101,7 +101,13 @@ class TinyKvFullCache(TinyKvCache):
 
     def _logical_key_values(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return only initialized tokens, never the unused physical tail."""
-        pass
+        if self.key_values is None:
+            raise ValueError("KV empty")
+        k_buf, v_buf = self.key_values
+        return (
+            k_buf[:, :, : self.offset, :],
+            v_buf[:, :, : self.offset, :],
+        )
 
     def update_and_fetch(
         self,
@@ -109,15 +115,72 @@ class TinyKvFullCache(TinyKvCache):
         value: torch.Tensor,
         mask_length: int | None = None,
         mask: torch.Tensor | str | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, int, Optional[torch.Tensor]]:
-        pass
+    ) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor | str | None]:
+        if self.capacity is None:
+            self.offset += key.shape[2]
+            if not self.key_values:
+                self.key_values = (key, value)
+                return (key, value, self.offset, mask)
+            old_keys, old_values = self.key_values
+            copied_bytes = (
+                old_keys.numel() * old_keys.element_size()
+                + old_values.numel() * old_values.element_size()
+            )
+            self.logical_copy_bytes += copied_bytes
+            self.physical_growth_copy_bytes += copied_bytes
+            self.growth_copy_bytes += copied_bytes
+            new_keys = torch.cat((old_keys, key), dim=2)
+            new_values = torch.cat((old_values, value), dim=2)
+            self.key_values = (new_keys, new_values)
+            return (new_keys, new_values, self.offset, mask)
+
+        start = self.offset
+        B, Hkv, seq_len, D = key.shape
+        end = start + seq_len
+        if end > self.capacity:
+            raise ValueError("capacity")
+        if self.key_values is None:
+            self.key_values = (
+                torch.empty(
+                    (B, Hkv, self.capacity, D), dtype=key.dtype, device=key.device
+                ),
+                torch.empty(
+                    (B, Hkv, self.capacity, D), dtype=value.dtype, device=value.device
+                ),
+            )
+        k_buf, v_buf = self.key_values
+        k_buf[:, :, start:end, :] = key
+        v_buf[:, :, start:end, :] = value
+        self.slice_write_bytes += (
+            key.numel() * key.element_size() + value.numel() * key.element_size()
+        )
+        self.offset = end
+        return (
+            k_buf[:, :, : self.offset, :],
+            v_buf[:, :, : self.offset, :],
+            self.offset,
+            mask,
+        )
 
     def materialize(self):
         pass
 
     def reset(self):
         """Reset logical length while retaining bounded physical storage."""
-        pass
+        self.offset = 0
+        if self.capacity is None:
+            self.key_values = None
 
     def rewind(self, n: int):
-        pass
+        if n < 0 or n > self.offset:
+            raise ValueError("remind out of boundary")
+        if self.key_values is None:
+            raise ValueError("empty")
+        self.offset -= n
+        if self.capacity is None:
+            k, v = self.key_values
+            self.key_values = (k[:, :, : self.offset, :], v[:, :, : self.offset, :])
+
+    def release(self):
+        self.key_values = None
+        self.offset = 0

@@ -1,11 +1,14 @@
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
+from .basics import linear, silu
+from .positional_encoding import RoPE
+from .layer_norm import RMSNorm
 
 import torch
 
 from .embedding import Embedding  # noqa: F401 - learner checkpoint dependency
-from .kv_cache import TinyKvCache
+from .kv_cache import TinyKvCache, TinyKvFullCache
 from .quantize import QuantizedWeights, dequantize_linear  # noqa: F401
 from .week2_kernels import (
     FastRMSNorm,  # noqa: F401 - learner checkpoint dependency
@@ -102,7 +105,17 @@ class Qwen3MultiHeadAttention:
         use_fast_rope: bool = True,
         use_tiled_prefill_attention: bool = False,
     ):
-        pass
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.rms_norm_eps = rms_norm_eps
+        self.wq = wq
+        self.wk = wk
+        self.wv = wv
+        self.wo = wo
+        self.q_norm = RMSNorm(head_dim, q_norm, eps=rms_norm_eps)
+        self.k_norm = RMSNorm(head_dim, k_norm, eps=rms_norm_eps)
+        self.rope = RoPE(head_dim, max_seq_len, theta)
 
     def __call__(
         self,
@@ -111,7 +124,42 @@ class Qwen3MultiHeadAttention:
         cache: TinyKvCache,
         mask: torch.Tensor | str | None = None,
     ) -> torch.Tensor:
-        pass
+        B, L, _ = x.shape
+        q = linear(x, self.wq)
+        k = linear(x, self.wk)
+        v = linear(x, self.wv)
+        q = q.reshape(B, L, self.num_heads, self.head_dim)
+        k = k.reshape(B, L, self.num_kv_heads, self.head_dim)
+        v = v.reshape(B, L, self.num_kv_heads, self.head_dim)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        q = self.rope(q, slice(offsets, L + offsets))
+        k = self.rope(k, slice(offsets, L + offsets))
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        keys, values, _, mask = cache.update_and_fetch(k, v, mask=mask)
+        S = keys.shape[2]
+        attention_mask = mask
+        if isinstance(mask, str) and mask == "causal":
+            query_pos = torch.arange(offsets, L + offsets, device=q.device)
+            key_pos = torch.arange(0, S, device=k.device)
+            attention_mask = key_pos[None, :] <= query_pos[:, None]
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            keys,
+            values,
+            attn_mask=attention_mask,
+            is_causal=False,
+            dropout_p=0.0,
+            enable_gqa=True,
+        )
+        out = (
+            out.transpose(1, 2)
+            .reshape(B, L, self.num_heads * self.head_dim)
+            .to(dtype=x.dtype)
+        )
+        return linear(out, self.wo)
 
 
 class Qwen3MLP:
@@ -124,10 +172,15 @@ class Qwen3MLP:
         w_down: torch.Tensor | QuantizedWeights,
         use_fast_swiglu: bool = True,
     ):
-        pass
+        self.w_gate = w_gate
+        self.w_up = w_up
+        self.w_down = w_down
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        pass
+        gate = silu(linear(x, self.w_gate))
+        up = linear(x, self.w_up)
+        up_gated = gate * up
+        return linear(up_gated, self.w_down)
 
 
 class Qwen3TransformerBlock:
@@ -157,7 +210,26 @@ class Qwen3TransformerBlock:
         use_fast_swiglu: bool = True,
         use_tiled_prefill_attention: bool = False,
     ):
-        pass
+        self.input_layernorm = RMSNorm(hidden_size, w_input_layernorm, rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            hidden_size, w_post_attention_layernorm, rms_norm_eps
+        )
+        self.mlp = Qwen3MLP(hidden_size, intermediate_size, w_gate, w_up, w_down)
+        self.self_attn = Qwen3MultiHeadAttention(
+            hidden_size,
+            num_attention_heads,
+            num_kv_heads,
+            head_dim,
+            wq,
+            wk,
+            wv,
+            wo,
+            q_norm,
+            k_norm,
+            max_seq_len,
+            theta,
+            rms_norm_eps,
+        )
 
     def __call__(
         self,
@@ -166,7 +238,15 @@ class Qwen3TransformerBlock:
         cache: TinyKvCache,
         mask: torch.Tensor | str | None = None,
     ) -> torch.Tensor:
-        pass
+        residual = x
+        x = self.input_layernorm(x)
+        x = self.self_attn(x, offset, cache, mask)
+        x = x + residual
+        post_residual = x
+        x = self.post_attention_layernorm(x)
+        x = self.mlp(x)
+        x = x + post_residual
+        return x
 
 
 class Qwen3ModelWeek2:
@@ -180,10 +260,51 @@ class Qwen3ModelWeek2:
         use_tiled_prefill_attention: bool | None = None,
     ):
         self.num_hidden_layers = hf_model.config.num_hidden_layers
-        pass
+        config = hf_model.config
+        self.embedding = Embedding(
+            config.vocab_size, config.hidden_size, hf_model.model.embed_tokens.weight
+        )
+        self.device = hf_model.model.embed_tokens.weight.device
+        self.norm = RMSNorm(
+            config.hidden_size, hf_model.model.norm.weight, config.rms_norm_eps
+        )
+        self.layers_inner = []
+        for layer in hf_model.model.layers:
+            self.layers_inner.append(
+                Qwen3TransformerBlock(
+                    config.num_attention_heads,
+                    config.num_key_value_heads,
+                    config.hidden_size,
+                    config.head_dim,
+                    config.intermediate_size,
+                    config.rms_norm_eps,
+                    layer.self_attn.q_proj.weight,
+                    layer.self_attn.k_proj.weight,
+                    layer.self_attn.v_proj.weight,
+                    layer.self_attn.o_proj.weight,
+                    layer.self_attn.q_norm.weight,
+                    layer.self_attn.k_norm.weight,
+                    layer.mlp.gate_proj.weight,
+                    layer.mlp.up_proj.weight,
+                    layer.mlp.down_proj.weight,
+                    layer.input_layernorm.weight,
+                    layer.post_attention_layernorm.weight,
+                    config.max_position_embeddings,
+                    config.rope_theta,
+                )
+            )
+        self.tie_word_embeddings = config.tie_word_embeddings
+        if not config.tie_word_embeddings:
+            self.lm_head_weight = hf_model.lm_head.weight
+        features = WEEK2_CHECKPOINT_FEATURES[checkpoint]
+        self.use_bounded_kv_capacity = (
+            features.bounded_kv_capacity
+            if use_bounded_kv_capacity is None
+            else use_bounded_kv_capacity
+        )
 
     def create_kv_cache(self, capacity: int | None = None) -> list[TinyKvCache]:
-        pass
+        return [TinyKvFullCache(capacity=capacity) for _ in self.layers_inner]
 
     def __call__(
         self,
@@ -192,4 +313,19 @@ class Qwen3ModelWeek2:
         cache: list[TinyKvCache],
         logits_to_keep: int | None = None,
     ) -> torch.Tensor:
-        pass
+        x = self.embedding(inputs)
+        for c in cache:
+            if c.offset != offset:
+                raise ValueError("offset not match")
+        for i in range(0, len(cache)):
+            layer = self.layers_inner[i]
+            c = cache[i]
+            x = layer(x, offset, c, mask="causal")
+        if logits_to_keep == 1:
+            x = x[:, -1:, :]
+        x = self.norm(x)
+        if self.tie_word_embeddings:
+            x = self.embedding.as_linear(x)
+        else:
+            x = linear(x, self.lm_head_weight)
+        return x
