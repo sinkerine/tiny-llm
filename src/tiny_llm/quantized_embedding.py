@@ -10,9 +10,14 @@ class QuantizedEmbedding:
         self.weight = weight
 
     def __call__(self, x):
-        # TODO: dequantize only the rows selected by token IDs.
-        raise NotImplementedError("Week 2 Day 2: selected-row embedding")
+        idx = x.long()
+        weight = self.weight.weight[idx]
+        scales = self.weight.scales[idx]
+        biases = self.weight.biases[idx] if self.weight.biases is not None else None
+        dense_weight = dequantize_weights(
+            weight, scales, biases, self.weight.group_size, bits=self.weight.bits
+        )
+        return dense_weight
 
     def as_linear(self, x):
-        # TODO: project hidden vectors through the packed embedding weights.
-        raise NotImplementedError("Week 2 Day 2: packed vocabulary projection")
+        return quantized_linear(x, self.weight)

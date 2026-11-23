@@ -42,10 +42,12 @@ def cached_generate(
     kv_cache = model.create_kv_cache(capacity)
     try:
         with torch.inference_mode():
-            if hasattr(model, "embedding"):
-                device = model.embedding.weight.device
-            else:
-                device = model.device
+            device = getattr(model, "device", None)
+            if device is None:
+                emb_w = model.embedding.weight
+                device = (
+                    emb_w.weight.device if hasattr(emb_w, "weight") else emb_w.device
+                )
             x = torch.tensor([tokens], dtype=torch.long, device=device)
             streamer = TextStreamer(tokenizer)
             offset = 0

@@ -9,7 +9,8 @@ import torch
 
 from .embedding import Embedding  # noqa: F401 - learner checkpoint dependency
 from .kv_cache import TinyKvCache, TinyKvFullCache
-from .quantize import QuantizedWeights, dequantize_linear  # noqa: F401
+from .quantize import QuantizedWeights, dequantize_linear, quantized_linear  # noqa: F401
+from .quantized_embedding import QuantizedEmbedding
 from .week2_kernels import (
     FastRMSNorm,  # noqa: F401 - learner checkpoint dependency
     FastRoPE,  # noqa: F401 - learner checkpoint dependency
@@ -85,6 +86,12 @@ WEEK2_CHECKPOINT_FEATURES = MappingProxyType(
 WEEK2_CHECKPOINTS = tuple(WEEK2_CHECKPOINT_FEATURES)
 
 
+def _project(x: torch.Tensor, w: torch.Tensor | QuantizedWeights) -> torch.Tensor:
+    if isinstance(w, QuantizedWeights):
+        return quantized_linear(x, w)
+    return linear(x, w)
+
+
 class Qwen3MultiHeadAttention:
     def __init__(
         self,
@@ -125,9 +132,9 @@ class Qwen3MultiHeadAttention:
         mask: torch.Tensor | str | None = None,
     ) -> torch.Tensor:
         B, L, _ = x.shape
-        q = linear(x, self.wq)
-        k = linear(x, self.wk)
-        v = linear(x, self.wv)
+        q = _project(x, self.wq)
+        k = _project(x, self.wk)
+        v = _project(x, self.wv)
         q = q.reshape(B, L, self.num_heads, self.head_dim)
         k = k.reshape(B, L, self.num_kv_heads, self.head_dim)
         v = v.reshape(B, L, self.num_kv_heads, self.head_dim)
@@ -159,7 +166,7 @@ class Qwen3MultiHeadAttention:
             .reshape(B, L, self.num_heads * self.head_dim)
             .to(dtype=x.dtype)
         )
-        return linear(out, self.wo)
+        return _project(out, self.wo)
 
 
 class Qwen3MLP:
@@ -177,10 +184,10 @@ class Qwen3MLP:
         self.w_down = w_down
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        gate = silu(linear(x, self.w_gate))
-        up = linear(x, self.w_up)
+        gate = silu(_project(x, self.w_gate))
+        up = _project(x, self.w_up)
         up_gated = gate * up
-        return linear(up_gated, self.w_down)
+        return _project(up_gated, self.w_down)
 
 
 class Qwen3TransformerBlock:
@@ -259,12 +266,35 @@ class Qwen3ModelWeek2:
         use_register_cached_rms_norm: bool | None = None,
         use_tiled_prefill_attention: bool | None = None,
     ):
+        features = WEEK2_CHECKPOINT_FEATURES[checkpoint]
+        self.use_bounded_kv_capacity = (
+            features.bounded_kv_capacity
+            if use_bounded_kv_capacity is None
+            else use_bounded_kv_capacity
+        )
         self.num_hidden_layers = hf_model.config.num_hidden_layers
         config = hf_model.config
-        self.embedding = Embedding(
-            config.vocab_size, config.hidden_size, hf_model.model.embed_tokens.weight
-        )
         self.device = hf_model.model.embed_tokens.weight.device
+
+        def pack_weight(layer: Any) -> torch.Tensor | QuantizedWeights:
+            if features.quantized_weights:
+                return QuantizedWeights.from_layer(
+                    layer,
+                    use_simdgroup_matmul=features.simdgroup_matmul,
+                    use_torch_quantized_linear=use_torch_quantized_linear,
+                )
+            return layer.weight
+
+        if features.quantized_weights:
+            self.embedding = QuantizedEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                pack_weight(hf_model.model.embed_tokens),
+            )
+        else:
+            self.embedding = Embedding(
+                config.vocab_size, config.hidden_size, hf_model.model.embed_tokens.weight
+            )
         self.norm = RMSNorm(
             config.hidden_size, hf_model.model.norm.weight, config.rms_norm_eps
         )
@@ -278,15 +308,15 @@ class Qwen3ModelWeek2:
                     config.head_dim,
                     config.intermediate_size,
                     config.rms_norm_eps,
-                    layer.self_attn.q_proj.weight,
-                    layer.self_attn.k_proj.weight,
-                    layer.self_attn.v_proj.weight,
-                    layer.self_attn.o_proj.weight,
+                    pack_weight(layer.self_attn.q_proj),
+                    pack_weight(layer.self_attn.k_proj),
+                    pack_weight(layer.self_attn.v_proj),
+                    pack_weight(layer.self_attn.o_proj),
                     layer.self_attn.q_norm.weight,
                     layer.self_attn.k_norm.weight,
-                    layer.mlp.gate_proj.weight,
-                    layer.mlp.up_proj.weight,
-                    layer.mlp.down_proj.weight,
+                    pack_weight(layer.mlp.gate_proj),
+                    pack_weight(layer.mlp.up_proj),
+                    pack_weight(layer.mlp.down_proj),
                     layer.input_layernorm.weight,
                     layer.post_attention_layernorm.weight,
                     config.max_position_embeddings,
@@ -295,13 +325,7 @@ class Qwen3ModelWeek2:
             )
         self.tie_word_embeddings = config.tie_word_embeddings
         if not config.tie_word_embeddings:
-            self.lm_head_weight = hf_model.lm_head.weight
-        features = WEEK2_CHECKPOINT_FEATURES[checkpoint]
-        self.use_bounded_kv_capacity = (
-            features.bounded_kv_capacity
-            if use_bounded_kv_capacity is None
-            else use_bounded_kv_capacity
-        )
+            self.lm_head_weight = pack_weight(hf_model.lm_head)
 
     def create_kv_cache(self, capacity: int | None = None) -> list[TinyKvCache]:
         return [TinyKvFullCache(capacity=capacity) for _ in self.layers_inner]
@@ -327,5 +351,5 @@ class Qwen3ModelWeek2:
         if self.tie_word_embeddings:
             x = self.embedding.as_linear(x)
         else:
-            x = linear(x, self.lm_head_weight)
+            x = _project(x, self.lm_head_weight)
         return x
