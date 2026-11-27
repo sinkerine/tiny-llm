@@ -16,7 +16,11 @@ class FastRMSNorm:
         }
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        pass
+        if x.shape[-1] <= 4096:
+            self.dispatch_counts["register_cached"] += 1
+        else:
+            self.dispatch_counts["fixed_width_fallback"] += 1
+        return cuda_ops.rms_norm(x.contiguous(), self.weight.contiguous(), self.eps)
 
 
 class FastRoPE:
@@ -27,16 +31,36 @@ class FastRoPE:
         base: int = 10000,
         traditional: bool = False,
     ):
-        pass
+        self.dims = dims
+        self.seq_len = seq_len
+        self.base = base
+        self.traditional = traditional
 
     def __call__(
         self, x: torch.Tensor, offset: int | list[int] | torch.Tensor = 0
     ) -> torch.Tensor:
-        pass
+        if x.ndim != 4:
+            raise ValueError(f"FastRoPE expects 4D [B,L,H,D] input, got shape {tuple(x.shape)}")
+        batch = x.shape[0]
+        if isinstance(offset, int):
+            offsets = torch.full((batch,), offset, dtype=torch.long, device=x.device)
+        else:
+            t = torch.as_tensor(offset, dtype=torch.long, device=x.device)
+            if t.ndim == 0:
+                offsets = t.expand(batch).contiguous()
+            elif t.ndim == 1 and t.shape[0] == batch:
+                offsets = t.contiguous()
+            else:
+                raise ValueError(
+                    f"FastRoPE expects scalar or [{batch}] offsets, got shape {tuple(t.shape)}"
+                )
+        return cuda_ops.rope(
+            x.contiguous(), offsets, self.dims, float(self.base), self.traditional
+        )
 
 
 def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-    pass
+    return cuda_ops.swiglu(gate.contiguous(), up.contiguous())
 
 
 def scaled_dot_product_attention(

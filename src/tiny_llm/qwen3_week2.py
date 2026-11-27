@@ -120,9 +120,15 @@ class Qwen3MultiHeadAttention:
         self.wk = wk
         self.wv = wv
         self.wo = wo
-        self.q_norm = RMSNorm(head_dim, q_norm, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(head_dim, k_norm, eps=rms_norm_eps)
-        self.rope = RoPE(head_dim, max_seq_len, theta)
+        norm_cls = FastRMSNorm if use_fast_rms_norm else RMSNorm
+        self.q_norm = norm_cls(head_dim, q_norm, eps=rms_norm_eps)
+        self.k_norm = norm_cls(head_dim, k_norm, eps=rms_norm_eps)
+        self.use_fast_rope = use_fast_rope
+        self.rope = (
+            FastRoPE(head_dim, max_seq_len, theta)
+            if use_fast_rope
+            else RoPE(head_dim, max_seq_len, theta)
+        )
 
     def __call__(
         self,
@@ -140,8 +146,12 @@ class Qwen3MultiHeadAttention:
         v = v.reshape(B, L, self.num_kv_heads, self.head_dim)
         q = self.q_norm(q)
         k = self.k_norm(k)
-        q = self.rope(q, slice(offsets, L + offsets))
-        k = self.rope(k, slice(offsets, L + offsets))
+        if self.use_fast_rope:
+            q = self.rope(q, offsets)
+            k = self.rope(k, offsets)
+        else:
+            q = self.rope(q, slice(offsets, L + offsets))
+            k = self.rope(k, slice(offsets, L + offsets))
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
@@ -182,11 +192,15 @@ class Qwen3MLP:
         self.w_gate = w_gate
         self.w_up = w_up
         self.w_down = w_down
+        self.use_fast_swiglu = use_fast_swiglu
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        gate = silu(_project(x, self.w_gate))
+        gate = _project(x, self.w_gate)
         up = _project(x, self.w_up)
-        up_gated = gate * up
+        if self.use_fast_swiglu:
+            up_gated = swiglu(gate, up)
+        else:
+            up_gated = silu(gate) * up
         return _project(up_gated, self.w_down)
 
 
@@ -217,11 +231,19 @@ class Qwen3TransformerBlock:
         use_fast_swiglu: bool = True,
         use_tiled_prefill_attention: bool = False,
     ):
-        self.input_layernorm = RMSNorm(hidden_size, w_input_layernorm, rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
+        norm_cls = FastRMSNorm if use_fast_rms_norm else RMSNorm
+        self.input_layernorm = norm_cls(hidden_size, w_input_layernorm, rms_norm_eps)
+        self.post_attention_layernorm = norm_cls(
             hidden_size, w_post_attention_layernorm, rms_norm_eps
         )
-        self.mlp = Qwen3MLP(hidden_size, intermediate_size, w_gate, w_up, w_down)
+        self.mlp = Qwen3MLP(
+            hidden_size,
+            intermediate_size,
+            w_gate,
+            w_up,
+            w_down,
+            use_fast_swiglu=use_fast_swiglu,
+        )
         self.self_attn = Qwen3MultiHeadAttention(
             hidden_size,
             num_attention_heads,
@@ -236,6 +258,8 @@ class Qwen3TransformerBlock:
             max_seq_len,
             theta,
             rms_norm_eps,
+            use_fast_rms_norm=use_fast_rms_norm,
+            use_fast_rope=use_fast_rope,
         )
 
     def __call__(
@@ -295,7 +319,8 @@ class Qwen3ModelWeek2:
             self.embedding = Embedding(
                 config.vocab_size, config.hidden_size, hf_model.model.embed_tokens.weight
             )
-        self.norm = RMSNorm(
+        norm_cls = FastRMSNorm if features.fast_rms_norm else RMSNorm
+        self.norm = norm_cls(
             config.hidden_size, hf_model.model.norm.weight, config.rms_norm_eps
         )
         self.layers_inner = []
@@ -321,6 +346,9 @@ class Qwen3ModelWeek2:
                     layer.post_attention_layernorm.weight,
                     config.max_position_embeddings,
                     config.rope_theta,
+                    use_fast_rms_norm=features.fast_rms_norm,
+                    use_fast_rope=features.fast_rope,
+                    use_fast_swiglu=features.fast_swiglu,
                 )
             )
         self.tie_word_embeddings = config.tie_word_embeddings

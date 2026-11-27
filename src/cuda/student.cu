@@ -180,6 +180,152 @@ __global__ void w4_wmma_kernel(
 #endif
 }
 
+constexpr int kRmsThreads = 256;
+constexpr int kRmsRegisterCap = 4096;
+constexpr int kRmsMaxPerThread = kRmsRegisterCap / kRmsThreads;
+
+template <typename scalar_t, bool RegisterCached>
+__global__ void rms_norm_kernel(
+    const scalar_t* __restrict__ x,
+    const scalar_t* __restrict__ weight,
+    scalar_t* __restrict__ out,
+    int64_t D,
+    float eps) {
+    int64_t row = static_cast<int64_t>(blockIdx.x);
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp_id = tid >> 5;
+
+    const scalar_t* x_row = x + row * D;
+    scalar_t* out_row = out + row * D;
+
+    float regs[RegisterCached ? kRmsMaxPerThread : 1];
+    float sum_sq = 0.0f;
+    if constexpr (RegisterCached) {
+        int idx = 0;
+        for (int64_t col = tid; col < D; col += kRmsThreads) {
+            float xf = static_cast<float>(x_row[col]);
+            regs[idx++] = xf;
+            sum_sq += xf * xf;
+        }
+    } else {
+        for (int64_t col = tid; col < D; col += kRmsThreads) {
+            float xf = static_cast<float>(x_row[col]);
+            sum_sq += xf * xf;
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_down_sync(0xffffffffu, sum_sq, offset);
+    }
+    __shared__ float warp_sums[kRmsThreads / 32];
+    if (lane == 0) {
+        warp_sums[warp_id] = sum_sq;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float val = (lane < (kRmsThreads / 32)) ? warp_sums[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            val += __shfl_down_sync(0xffffffffu, val, offset);
+        }
+        if (lane == 0) {
+            warp_sums[0] = rsqrtf(val / static_cast<float>(D) + eps);
+        }
+    }
+    __syncthreads();
+
+    float inv_rms = warp_sums[0];
+    if constexpr (RegisterCached) {
+        int idx = 0;
+        for (int64_t col = tid; col < D; col += kRmsThreads) {
+            scalar_t normed = static_cast<scalar_t>(regs[idx++] * inv_rms);
+            out_row[col] = static_cast<scalar_t>(
+                static_cast<float>(normed) * static_cast<float>(weight[col]));
+        }
+    } else {
+        for (int64_t col = tid; col < D; col += kRmsThreads) {
+            float xf = static_cast<float>(x_row[col]);
+            scalar_t normed = static_cast<scalar_t>(xf * inv_rms);
+            out_row[col] = static_cast<scalar_t>(
+                static_cast<float>(normed) * static_cast<float>(weight[col]));
+        }
+    }
+}
+
+constexpr int kRopeThreads = 256;
+
+template <typename scalar_t>
+__global__ void rope_kernel(
+    const scalar_t* __restrict__ x,
+    const int64_t* __restrict__ offsets,
+    scalar_t* __restrict__ out,
+    int64_t L,
+    int64_t H,
+    int64_t D,
+    int64_t total_pairs,
+    float base,
+    bool traditional) {
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total_pairs) {
+        return;
+    }
+
+    int64_t half_d = D >> 1;
+    int64_t j = idx % half_d;
+    int64_t tmp = idx / half_d;
+    int64_t h = tmp % H;
+    tmp /= H;
+    int64_t l = tmp % L;
+    int64_t b = tmp / L;
+
+    float pos = static_cast<float>(offsets[b] + l);
+    float freq = powf(base, -static_cast<float>(j) / static_cast<float>(half_d));
+    float angle = pos * freq;
+    scalar_t co = static_cast<scalar_t>(cosf(angle));
+    scalar_t si = static_cast<scalar_t>(sinf(angle));
+
+    int64_t row_base = ((b * L + l) * H + h) * D;
+    int64_t i0 = traditional ? (2 * j) : j;
+    int64_t i1 = traditional ? (2 * j + 1) : (j + half_d);
+
+    float uf = static_cast<float>(x[row_base + i0]);
+    float vf = static_cast<float>(x[row_base + i1]);
+    float cf = static_cast<float>(co);
+    float sf = static_cast<float>(si);
+
+    scalar_t u_co = static_cast<scalar_t>(uf * cf);
+    scalar_t v_si = static_cast<scalar_t>(vf * sf);
+    scalar_t u_si = static_cast<scalar_t>(uf * sf);
+    scalar_t v_co = static_cast<scalar_t>(vf * cf);
+
+    out[row_base + i0] = static_cast<scalar_t>(
+        static_cast<float>(u_co) - static_cast<float>(v_si));
+    out[row_base + i1] = static_cast<scalar_t>(
+        static_cast<float>(u_si) + static_cast<float>(v_co));
+}
+
+constexpr int kSwigluThreads = 256;
+
+template <typename scalar_t>
+__global__ void swiglu_kernel(
+    const scalar_t* __restrict__ gate,
+    const scalar_t* __restrict__ up,
+    scalar_t* __restrict__ out,
+    int64_t n) {
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+
+    float g = static_cast<float>(gate[idx]);
+    float e = expf(-fabsf(g));
+    float silu_f = (g >= 0.0f) ? (g / (1.0f + e)) : (g * e / (1.0f + e));
+    scalar_t silu_t = static_cast<scalar_t>(silu_f);
+    out[idx] = static_cast<scalar_t>(
+        static_cast<float>(silu_t) * static_cast<float>(up[idx]));
+}
+
 }  // namespace
 
 // Reference-only selected scheduling controls are not additional learner tasks.
@@ -249,9 +395,108 @@ Tensor w4_cuda(
     }
     TORCH_CHECK(false, "unknown W4 kernel mode");
 }
-Tensor rms_cuda(Tensor, Tensor, double) { TORCH_CHECK(false, "Week 2 Day 4: implement RMSNorm CUDA"); }
-Tensor rope_cuda(Tensor, Tensor, int64_t, double, bool) { TORCH_CHECK(false, "Week 2 Day 4: implement RoPE CUDA"); }
-Tensor swiglu_cuda(Tensor, Tensor) { TORCH_CHECK(false, "Week 2 Day 4: implement SwiGLU CUDA"); }
+Tensor rms_cuda(Tensor x, Tensor weight, double eps) {
+    c10::cuda::CUDAGuard guard(x.device());
+    int64_t D = x.size(-1);
+    int64_t rows = x.numel() / D;
+    Tensor out = at::empty_like(x);
+    if (rows == 0) {
+        return out;
+    }
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    float eps_f = static_cast<float>(eps);
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        x.scalar_type(),
+        "rms_cuda",
+        [&] {
+            const auto* x_ptr = x.data_ptr<scalar_t>();
+            const auto* w_ptr = weight.data_ptr<scalar_t>();
+            auto* out_ptr = out.data_ptr<scalar_t>();
+            if (D <= kRmsRegisterCap) {
+                rms_norm_kernel<scalar_t, true>
+                    <<<static_cast<unsigned int>(rows), kRmsThreads, 0, stream>>>(
+                        x_ptr, w_ptr, out_ptr, D, eps_f);
+            } else {
+                rms_norm_kernel<scalar_t, false>
+                    <<<static_cast<unsigned int>(rows), kRmsThreads, 0, stream>>>(
+                        x_ptr, w_ptr, out_ptr, D, eps_f);
+            }
+        });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+Tensor rope_cuda(
+    Tensor x,
+    Tensor offsets,
+    int64_t dims,
+    double base,
+    bool traditional) {
+    c10::cuda::CUDAGuard guard(x.device());
+    int64_t B = x.size(0);
+    int64_t L = x.size(1);
+    int64_t H = x.size(2);
+    int64_t D = x.size(3);
+    int64_t total_pairs = B * L * H * (D >> 1);
+    Tensor out = at::empty_like(x);
+    if (total_pairs == 0) {
+        return out;
+    }
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    unsigned int grid =
+        static_cast<unsigned int>((total_pairs + kRopeThreads - 1) / kRopeThreads);
+    float base_f = static_cast<float>(base);
+    const int64_t* off_ptr = offsets.data_ptr<int64_t>();
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        x.scalar_type(),
+        "rope_cuda",
+        [&] {
+            rope_kernel<scalar_t><<<grid, kRopeThreads, 0, stream>>>(
+                x.data_ptr<scalar_t>(),
+                off_ptr,
+                out.data_ptr<scalar_t>(),
+                L,
+                H,
+                D,
+                total_pairs,
+                base_f,
+                traditional);
+        });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+Tensor swiglu_cuda(Tensor gate, Tensor up) {
+    c10::cuda::CUDAGuard guard(gate.device());
+    int64_t n = gate.numel();
+    Tensor out = at::empty_like(gate);
+    if (n == 0) {
+        return out;
+    }
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    unsigned int grid =
+        static_cast<unsigned int>((n + kSwigluThreads - 1) / kSwigluThreads);
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        gate.scalar_type(),
+        "swiglu_cuda",
+        [&] {
+            swiglu_kernel<scalar_t><<<grid, kSwigluThreads, 0, stream>>>(
+                gate.data_ptr<scalar_t>(),
+                up.data_ptr<scalar_t>(),
+                out.data_ptr<scalar_t>(),
+                n);
+        });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
 Tensor attention_cuda(Tensor, Tensor, Tensor, Tensor, double, bool) {
     TORCH_CHECK(false, "Week 2 Day 5: implement tiled CUDA attention");
 }
