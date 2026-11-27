@@ -4,17 +4,22 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
+#include <mma.h>
 #include <cstdint>
 
 using at::Tensor;
 
 namespace {
 
-__device__ __forceinline__ float unpack_w4_bf16(
+__device__ __forceinline__ __nv_bfloat16 unpack_w4_as_bf16(
     uint32_t word, int nibble_idx, float scale, float bias) {
     uint32_t code = (word >> (4 * nibble_idx)) & 15u;
-    return __bfloat162float(
-        __float2bfloat16(static_cast<float>(code) * scale + bias));
+    return __float2bfloat16(static_cast<float>(code) * scale + bias);
+}
+
+__device__ __forceinline__ float unpack_w4_bf16(
+    uint32_t word, int nibble_idx, float scale, float bias) {
+    return __bfloat162float(unpack_w4_as_bf16(word, nibble_idx, scale, bias));
 }
 
 __global__ void w4_scalar_kernel(
@@ -97,6 +102,84 @@ __global__ void w4_warp_matvec_kernel(
     }
 }
 
+__global__ void w4_wmma_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const int32_t* __restrict__ packed,
+    const __nv_bfloat16* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ biases,
+    __nv_bfloat16* __restrict__ out,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t group_size) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    using namespace nvcuda;
+    int64_t m0 = static_cast<int64_t>(blockIdx.y) * 16;
+    int64_t n0 = static_cast<int64_t>(blockIdx.x) * 16;
+    int lane = threadIdx.x;
+
+    __shared__ alignas(16) __nv_bfloat16 a_sh[16 * 16];
+    __shared__ alignas(16) __nv_bfloat16 b_sh[16 * 16];
+    __shared__ alignas(16) float c_sh[16 * 16];
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major>
+        a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major>
+        b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    int64_t packed_k = K >> 3;
+    int64_t groups = K / group_size;
+
+    for (int64_t k0 = 0; k0 < K; k0 += 16) {
+        for (int idx = lane; idx < 256; idx += 32) {
+            int r = idx >> 4;
+            int c = idx & 15;
+
+            int64_t m = m0 + r;
+            int64_t k_a = k0 + c;
+            a_sh[idx] = (m < M && k_a < K)
+                            ? x[m * K + k_a]
+                            : __float2bfloat16(0.0f);
+
+            int64_t n = n0 + r;
+            int64_t k_b = k0 + c;
+            if (n < N && k_b < K) {
+                uint32_t word =
+                    static_cast<uint32_t>(packed[n * packed_k + (k_b >> 3)]);
+                int64_t g = k_b / group_size;
+                float scale = __bfloat162float(scales[n * groups + g]);
+                float bias = __bfloat162float(biases[n * groups + g]);
+                b_sh[idx] =
+                    unpack_w4_as_bf16(word, static_cast<int>(k_b & 7), scale, bias);
+            } else {
+                b_sh[idx] = __float2bfloat16(0.0f);
+            }
+        }
+        __syncwarp();
+
+        wmma::load_matrix_sync(a_frag, a_sh, 16);
+        wmma::load_matrix_sync(b_frag, b_sh, 16);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        __syncwarp();
+    }
+
+    wmma::store_matrix_sync(c_sh, c_frag, 16, wmma::mem_row_major);
+    __syncwarp();
+
+    for (int idx = lane; idx < 256; idx += 32) {
+        int r = idx >> 4;
+        int c = idx & 15;
+        int64_t m = m0 + r;
+        int64_t n = n0 + c;
+        if (m < M && n < N) {
+            out[m * N + n] = __float2bfloat16(c_sh[idx]);
+        }
+    }
+#endif
+}
+
 }  // namespace
 
 // Reference-only selected scheduling controls are not additional learner tasks.
@@ -154,7 +237,17 @@ Tensor w4_cuda(
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         return out;
     }
-    TORCH_CHECK(false, "Week 2 Day 3: implement packed W4 WMMA kernel (mode 2)");
+    if (mode == 2) {
+        dim3 block(32);
+        dim3 grid(
+            static_cast<unsigned int>((N + 15) / 16),
+            static_cast<unsigned int>((M + 15) / 16));
+        w4_wmma_kernel<<<grid, block, 0, stream>>>(
+            x_ptr, p_ptr, s_ptr, b_ptr, out_ptr, M, N, K, group_size);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return out;
+    }
+    TORCH_CHECK(false, "unknown W4 kernel mode");
 }
 Tensor rms_cuda(Tensor, Tensor, double) { TORCH_CHECK(false, "Week 2 Day 4: implement RMSNorm CUDA"); }
 Tensor rope_cuda(Tensor, Tensor, int64_t, double, bool) { TORCH_CHECK(false, "Week 2 Day 4: implement RoPE CUDA"); }
