@@ -69,12 +69,13 @@ pdm run test --week 3 --day 2 -- -k rectangular_mask
 
 ## Task 3: Materialize Between Chunks
 
-MLX is lazy. Extending an unevaluated cache repeatedly creates a long graph and
-can grow memory usage. Call each layer cache's `materialize()` hook after every
-chunk so the next scheduler iteration starts from materialized state. For the
-dense cache, implement `TinyKvFullCache.materialize` to evaluate its key/value
-tuple. The paged cache that arrives on Day 3 will evaluate its page pool
-storage without first gathering it into a dense tensor.
+CUDA kernels launch asynchronously on PyTorch's current stream. Call each layer
+cache's `materialize()` hook after every chunk so the next scheduler iteration
+starts from completed cache state. For the dense cache, implement
+`TinyKvFullCache.materialize` to synchronize the CUDA device when its cached
+tensors live on CUDA (`torch.cuda.synchronize(device)`). The paged cache that
+arrives on Day 3 will synchronize its page pool's CUDA device without gathering
+it into a dense tensor.
 
 The hook is part of the cache lifecycle rather than the scheduler's storage
 logic. This lets the scheduler use dense and paged caches without inspecting
@@ -118,36 +119,26 @@ chunks usually improve fairness but add scheduler and launch overhead; choose a
 default from the measured tradeoff rather than treating one chunk size as
 universal.
 
+Run the Day 2 test suite first:
+
 ```bash
-week3_result_root="$HOME/tiny-llm-week3-results"
-mkdir -p "$week3_result_root"
-week3_result_dir="$(mktemp -d "$week3_result_root/run-XXXXXX")"
-
 pdm run test --week 3 --day 2
-pdm run batch-main --solution tiny_llm --loader week2
-
-pdm run bench-chunked-prefill --solution tiny_llm --offline --model qwen3-0.6b \
-  --prefill-steps 32 128 512 --num-seqs 8 --batch-size 4 \
-  --min-input-len 64 --max-input-len 512 \
-  --min-output-len 32 --max-output-len 32 \
-  --warmup 1 --repeats 4 --cooldown-seconds 1 \
-  --json-output "$week3_result_dir/chunked-prefill-tiny-llm.json"
 ```
 
-This command measures your `tiny_llm` solution and writes a new JSON file
-outside the tracked historical corpus. For a current reference control, rerun
-the same flags with `--solution ref` and a different filename in the new
-directory; compare those new measurements with your own run. The table below
-is historical task #367 evidence from source
+To measure the fairness tradeoff on this PyTorch/CUDA checkout, run the same
+multi-prompt trace through `batch_generate` with several `prefill_step` values
+(for example 32, 128, and 512) and explicit `torch.cuda.synchronize()` around
+timed decode steps. (The older `batch-main` and `bench-chunked-prefill`
+entrypoints remain historical MLX/Metal scripts.)
+
+The table below is historical task #367 MLX/Metal evidence from source
 `18aec8503929d80c986324578068ecac2463c2ac`, before the five-day Week 2
-revamp. Its trace used seed 0 and the same 32-token output budget for every
-request. Each chunk size ran twice in forward order and twice in reverse order
-in fresh processes. Every row used the same canonical Week 3 MLX
-quantized-projection seam and the same course-owned scheduler, dense cache, and
-attention code; only the prefill budget changed. The saved JSON stores every prompt
-token id, the per-request output budget, and their canonical SHA-256 checksum.
-Running today's reference can produce different values; it does not reproduce
-the predecessor table.
+revamp and the CUDA port. Its trace used seed 0 and the same 32-token output
+budget for every request. Each chunk size ran twice in forward order and twice
+in reverse order in fresh processes, changing only the prefill budget. The
+saved JSON stores every prompt token id, the per-request output budget, and
+their canonical SHA-256 checksum. Running today's CUDA reference will produce
+different values; it does not reproduce the predecessor table.
 
 A decode-completion gap is the wall-clock interval between two consecutive
 synchronized decode calls while at least one decode request remains active. It

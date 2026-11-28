@@ -1,17 +1,16 @@
 from typing import Any
 
-import mlx.core as mx
+import torch
 
 from .attention import paged_attention
-from .embedding import QuantizedEmbedding
-from .kv_cache_mlx import TinyKvCache
+from .kv_cache import TinyKvCache
 from .moe import Moe
 from .paged_kv_cache import TinyKvPagedCache, TinyKvPagedPool
-from .quantize_mlx import QuantizedWeights, quantized_linear
-from .week2_kernels_mlx import (
+from .quantize import QuantizedWeights, quantized_linear
+from .quantized_embedding import QuantizedEmbedding
+from .week2_kernels import (
     FastRMSNorm,
     FastRoPE,
-    decode_attention_custom,
     scaled_dot_product_attention,
     swiglu,
 )
@@ -28,8 +27,8 @@ class Qwen3MultiHeadAttention:
         wk: QuantizedWeights,
         wv: QuantizedWeights,
         wo: QuantizedWeights,
-        q_norm: mx.array,
-        k_norm: mx.array,
+        q_norm: torch.Tensor,
+        k_norm: torch.Tensor,
         max_seq_len: int = 32768,
         theta: int = 1000000,
         rms_norm_eps: float = 1e-5,
@@ -54,11 +53,11 @@ class Qwen3MultiHeadAttention:
 
     def __call__(
         self,
-        x: mx.array,
-        offsets: int | list[int] | mx.array,
+        x: torch.Tensor,
+        offsets: int | list[int] | torch.Tensor,
         cache: TinyKvCache,
-        mask: mx.array | str | None = None,
-    ) -> mx.array:
+        mask: torch.Tensor | str | None = None,
+    ) -> torch.Tensor:
         B, L, _ = x.shape
         projection_q = quantized_linear(x, self.wq).reshape(
             B, L, self.num_heads, self.head_dim
@@ -73,9 +72,9 @@ class Qwen3MultiHeadAttention:
         )
         projection_q = self.rope(projection_q, offset=offsets)
         projection_k = self.rope(projection_k, offset=offsets)
-        projection_q = projection_q.transpose(0, 2, 1, 3)
-        projection_k = projection_k.transpose(0, 2, 1, 3)
-        projection_v = projection_v.transpose(0, 2, 1, 3)
+        projection_q = projection_q.permute(0, 2, 1, 3)
+        projection_k = projection_k.permute(0, 2, 1, 3)
+        projection_v = projection_v.permute(0, 2, 1, 3)
 
         if self.use_paged_attention:
             metadata = cache.update_and_fetch_paged(
@@ -101,23 +100,14 @@ class Qwen3MultiHeadAttention:
                 mask_length=L,
                 mask=mask,
             )
-            if L <= 8 and key.shape[-2] <= 256:
-                x = decode_attention_custom(
-                    projection_q,
-                    key,
-                    value,
-                    scale=self.scale,
-                    mask=mask,
-                )
-            else:
-                x = scaled_dot_product_attention(
-                    projection_q,
-                    key,
-                    value,
-                    scale=self.scale,
-                    mask=mask,
-                )
-        x = x.transpose(0, 2, 1, 3).reshape(B, L, self.num_heads * self.head_dim)
+            x = scaled_dot_product_attention(
+                projection_q,
+                key,
+                value,
+                scale=self.scale,
+                mask=mask,
+            )
+        x = x.permute(0, 2, 1, 3).reshape(B, L, self.num_heads * self.head_dim)
         return quantized_linear(x, self.wo)
 
 
@@ -136,7 +126,7 @@ class Qwen3MLP:
         self.w_up = w_up
         self.w_down = w_down
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
         return quantized_linear(
             swiglu(
                 quantized_linear(x, self.w_gate),
@@ -158,10 +148,10 @@ class Qwen3TransformerBlock:
         wk: QuantizedWeights,
         wv: QuantizedWeights,
         wo: QuantizedWeights,
-        q_norm: mx.array,
-        k_norm: mx.array,
-        w_input_layernorm: mx.array,
-        w_post_attention_layernorm: mx.array,
+        q_norm: torch.Tensor,
+        k_norm: torch.Tensor,
+        w_input_layernorm: torch.Tensor,
+        w_post_attention_layernorm: torch.Tensor,
         mlp: Qwen3MLP | Moe,
         max_seq_len: int = 32768,
         theta: int = 1000000,
@@ -195,11 +185,11 @@ class Qwen3TransformerBlock:
 
     def __call__(
         self,
-        x: mx.array,
-        offset: int | list[int] | mx.array,
+        x: torch.Tensor,
+        offset: int | list[int] | torch.Tensor,
         cache: TinyKvCache,
-        mask: mx.array | str | None = None,
-    ) -> mx.array:
+        mask: torch.Tensor | str | None = None,
+    ) -> torch.Tensor:
         r = self.self_attn(self.input_layernorm(x), offset, cache, mask)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
@@ -207,132 +197,142 @@ class Qwen3TransformerBlock:
         return out
 
 
-def is_qwen3_moe_sparse_layer(args: Any, layer_idx: int) -> bool:
+def is_qwen3_moe_sparse_layer(config: Any, layer_idx: int) -> bool:
     return (
-        getattr(args, "num_experts", 0) > 0
-        and layer_idx not in getattr(args, "mlp_only_layers", [])
-        and (layer_idx + 1) % getattr(args, "decoder_sparse_step", 1) == 0
+        getattr(config, "num_experts", 0) > 0
+        and layer_idx not in getattr(config, "mlp_only_layers", [])
+        and (layer_idx + 1) % getattr(config, "decoder_sparse_step", 1) == 0
     )
+
+
+def _pack_expert_weights(mlp_module: Any, proj_name: str, **kwargs) -> QuantizedWeights:
+    if hasattr(mlp_module, "switch_mlp"):
+        return QuantizedWeights.from_layer(
+            getattr(mlp_module.switch_mlp, proj_name), **kwargs
+        )
+    stacked = torch.stack(
+        [getattr(expert, proj_name).weight for expert in mlp_module.experts], dim=0
+    )
+    from types import SimpleNamespace
+
+    return QuantizedWeights.from_layer(SimpleNamespace(weight=stacked), **kwargs)
 
 
 class Qwen3ModelWeek3:
     def __init__(
         self,
-        mlx_model: Any,
+        hf_model: Any,
         page_size: int = 128,
         enable_paged_attention: bool = True,
-        use_mlx_quantized_linear: bool = True,
+        use_torch_quantized_linear: bool = False,
     ):
-        self.num_hidden_layers = mlx_model.args.num_hidden_layers
-        self.hidden_size = mlx_model.args.hidden_size
-        self.vocab_size = mlx_model.args.vocab_size
+        config = hf_model.config
+        self.num_hidden_layers = config.num_hidden_layers
+        self.hidden_size = config.hidden_size
+        self.vocab_size = config.vocab_size
         self.page_size = page_size
-        # Each layer owns physical storage shared by all request caches for that
-        # layer. Page ids are therefore layer-local, as they are in the kernel.
+        self.device = hf_model.model.embed_tokens.weight.device
         self.page_pools = [
             TinyKvPagedPool(page_size=self.page_size)
             for _ in range(self.num_hidden_layers)
         ]
-        precision = mx.bfloat16
-        self.precision = precision
-        # Dense Week 3 keeps the course-owned cache, attention, normalization,
-        # activation, and scheduler paths, but no longer inherits Week 2's
-        # teaching-oriented projection kernels. The optional MoE path retains
-        # its separately taught router/expert projection contract.
-        self.use_mlx_quantized_linear = use_mlx_quantized_linear and not getattr(
-            mlx_model.args, "num_experts", 0
-        )
+        self.precision = torch.bfloat16
+        self.use_torch_quantized_linear = use_torch_quantized_linear
 
         def week3_weights(layer: Any) -> QuantizedWeights:
-            return QuantizedWeights.from_mlx_layer(
+            return QuantizedWeights.from_layer(
                 layer,
                 use_simdgroup_matmul=True,
-                use_split_k_matmul=True,
-                use_mlx_quantized_linear=self.use_mlx_quantized_linear,
+                use_torch_quantized_linear=self.use_torch_quantized_linear,
             )
 
         self.embedding = QuantizedEmbedding(
             vocab_size=self.vocab_size,
             embedding_dim=self.hidden_size,
-            weight=week3_weights(mlx_model.model.embed_tokens),
-            use_custom_kernel=True,
+            weight=week3_weights(hf_model.model.embed_tokens),
         )
         self.layers_inner = []
 
-        for i in range(mlx_model.args.num_hidden_layers):
-            wq = week3_weights(mlx_model.model.layers[i].self_attn.q_proj)
-            wk = week3_weights(mlx_model.model.layers[i].self_attn.k_proj)
-            wv = week3_weights(mlx_model.model.layers[i].self_attn.v_proj)
-            wo = week3_weights(mlx_model.model.layers[i].self_attn.o_proj)
-            if is_qwen3_moe_sparse_layer(mlx_model.args, i):
+        for i in range(config.num_hidden_layers):
+            src_layer = hf_model.model.layers[i]
+            wq = week3_weights(src_layer.self_attn.q_proj)
+            wk = week3_weights(src_layer.self_attn.k_proj)
+            wv = week3_weights(src_layer.self_attn.v_proj)
+            wo = week3_weights(src_layer.self_attn.o_proj)
+            if is_qwen3_moe_sparse_layer(config, i):
                 mlp = Moe(
-                    w_router=week3_weights(mlx_model.model.layers[i].mlp.gate),
-                    w_gate=week3_weights(
-                        mlx_model.model.layers[i].mlp.switch_mlp.gate_proj
+                    w_router=week3_weights(src_layer.mlp.gate),
+                    w_gate=_pack_expert_weights(
+                        src_layer.mlp,
+                        "gate_proj",
+                        use_simdgroup_matmul=True,
+                        use_torch_quantized_linear=self.use_torch_quantized_linear,
                     ),
-                    w_up=week3_weights(
-                        mlx_model.model.layers[i].mlp.switch_mlp.up_proj
+                    w_up=_pack_expert_weights(
+                        src_layer.mlp,
+                        "up_proj",
+                        use_simdgroup_matmul=True,
+                        use_torch_quantized_linear=self.use_torch_quantized_linear,
                     ),
-                    w_down=week3_weights(
-                        mlx_model.model.layers[i].mlp.switch_mlp.down_proj
+                    w_down=_pack_expert_weights(
+                        src_layer.mlp,
+                        "down_proj",
+                        use_simdgroup_matmul=True,
+                        use_torch_quantized_linear=self.use_torch_quantized_linear,
                     ),
-                    num_experts_per_tok=mlx_model.args.num_experts_per_tok,
-                    norm_topk_prob=mlx_model.args.norm_topk_prob,
+                    num_experts_per_tok=config.num_experts_per_tok,
+                    norm_topk_prob=getattr(config, "norm_topk_prob", False),
                 )
             else:
                 mlp = Qwen3MLP(
-                    mlx_model.args.hidden_size,
-                    mlx_model.args.intermediate_size,
-                    week3_weights(mlx_model.model.layers[i].mlp.gate_proj),
-                    week3_weights(mlx_model.model.layers[i].mlp.up_proj),
-                    week3_weights(mlx_model.model.layers[i].mlp.down_proj),
+                    config.hidden_size,
+                    config.intermediate_size,
+                    week3_weights(src_layer.mlp.gate_proj),
+                    week3_weights(src_layer.mlp.up_proj),
+                    week3_weights(src_layer.mlp.down_proj),
                 )
 
             layer = Qwen3TransformerBlock(
-                num_attention_heads=mlx_model.args.num_attention_heads,
-                num_kv_heads=mlx_model.args.num_key_value_heads,
-                hidden_size=mlx_model.args.hidden_size,
-                head_dim=mlx_model.args.head_dim,
-                rms_norm_eps=mlx_model.args.rms_norm_eps,
+                num_attention_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                hidden_size=config.hidden_size,
+                head_dim=config.head_dim,
+                rms_norm_eps=config.rms_norm_eps,
                 wq=wq,
                 wk=wk,
                 wv=wv,
                 wo=wo,
-                q_norm=mlx_model.model.layers[i].self_attn.q_norm.weight,
-                k_norm=mlx_model.model.layers[i].self_attn.k_norm.weight,
-                w_input_layernorm=mlx_model.model.layers[i].input_layernorm.weight,
-                w_post_attention_layernorm=mlx_model.model.layers[
-                    i
-                ].post_attention_layernorm.weight,
+                q_norm=src_layer.self_attn.q_norm.weight,
+                k_norm=src_layer.self_attn.k_norm.weight,
+                w_input_layernorm=src_layer.input_layernorm.weight,
+                w_post_attention_layernorm=src_layer.post_attention_layernorm.weight,
                 mlp=mlp,
-                max_seq_len=mlx_model.args.max_position_embeddings,
-                theta=mlx_model.args.rope_theta,
+                max_seq_len=config.max_position_embeddings,
+                theta=config.rope_theta,
                 use_paged_attention=enable_paged_attention,
             )
             self.layers_inner.append(layer)
         self.norm = FastRMSNorm(
-            mlx_model.args.hidden_size,
-            weight=mlx_model.model.norm.weight,
-            eps=mlx_model.args.rms_norm_eps,
+            config.hidden_size,
+            weight=hf_model.model.norm.weight,
+            eps=config.rms_norm_eps,
         )
-        if not mlx_model.args.tie_word_embeddings:
-            self.w_lm_head = week3_weights(mlx_model.lm_head)
+        if not config.tie_word_embeddings:
+            self.w_lm_head = week3_weights(hf_model.lm_head)
         else:
             self.w_lm_head = None
-        self.mlx_model = mlx_model
+        self.hf_model = hf_model
 
     def create_kv_cache(self) -> list[TinyKvCache]:
-        # One request gets one cache handle per layer. Requests share storage
-        # within a layer, while every handle keeps independent logical metadata.
         return [TinyKvPagedCache(pool=pool) for pool in self.page_pools]
 
     def __call__(
         self,
-        inputs: mx.array,
-        offset: int | list[int] | mx.array,
+        inputs: torch.Tensor,
+        offset: int | list[int] | torch.Tensor,
         cache: list[TinyKvCache],
         logits_to_keep: int | None = None,
-    ) -> mx.array:
+    ) -> torch.Tensor:
         h = self.embedding(inputs)
         for layer in range(self.num_hidden_layers):
             h = self.layers_inner[layer](h, offset, cache[layer], mask="causal")
@@ -343,5 +343,4 @@ class Qwen3ModelWeek3:
         h = self.norm(h)
         if self.w_lm_head is not None:
             return quantized_linear(h, self.w_lm_head)
-        else:
-            return self.embedding.as_linear(h)
+        return self.embedding.as_linear(h)

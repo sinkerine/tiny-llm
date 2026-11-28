@@ -8,6 +8,9 @@ Tensor swiglu_cuda(Tensor, Tensor);
 Tensor attention_cuda(Tensor, Tensor, Tensor, Tensor, double, bool);
 Tensor decode_cuda(Tensor, Tensor, Tensor, Tensor, double);
 Tensor qk_norm_rope_cuda(Tensor, Tensor, Tensor, double, double);
+Tensor paged_cache_update_cuda(Tensor, Tensor, int64_t, int64_t);
+Tensor paged_attention_cuda(
+    Tensor, Tensor, Tensor, Tensor, Tensor, int64_t, double, bool);
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("decode_online", &decode_cuda);
     m.def("qk_norm_rope", &qk_norm_rope_cuda);
@@ -16,4 +19,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rope", &rope_cuda);
     m.def("swiglu", &swiglu_cuda);
     m.def("attention", &attention_cuda);
+    m.def("paged_cache_update", &paged_cache_update_cuda);
+    m.def("paged_attention", &paged_attention_cuda);
 }

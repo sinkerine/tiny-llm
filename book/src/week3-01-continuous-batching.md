@@ -7,17 +7,17 @@ request can own a dense KV cache. The Day 1 starter leaves four learner-owned
 slices behind those interfaces:
 
 - dense batch assembly and masking in `BatchingKvCache`;
-- `mlx_quantized_linear` plus the per-weight selector and the explicit
-  `dispatch_week3_batch_model` factory;
+- `torch_quantized_linear` plus the per-weight `use_torch_quantized_linear`
+  selector and the explicit `dispatch_week3_batch_model` factory;
 - selector propagation through `Qwen3ModelWeek2`; and
 - `Request.try_prefill` plus the request-admission/decode loop in
   `batch_generate`.
 
 Complete and test those slices in order. The resulting **continuous batch**
 keeps several active requests on the device and replaces each request as soon
-as it finishes. Only quantized projections cross the Week 3 MLX seam;
-normalization, activation, RoPE, cache state, attention, and scheduling remain
-course-owned.
+as it finishes. When enabled, only quantized projections cross the optional
+PyTorch projection seam; normalization, activation, RoPE, cache state,
+attention, and scheduling remain course-owned.
 
 So far, each generation loop has processed only one request. That may not
 provide enough work to use the device efficiently, so Day 1 decodes several
@@ -111,30 +111,33 @@ pdm run test --week 3 --day 1 -- -k task_2
 ## Task 3: Add the Week 3 Projection Seam
 
 ```
-src/tiny_llm/quantize.py::mlx_quantized_linear
+src/tiny_llm/quantize.py::torch_quantized_linear
 src/tiny_llm/qwen3_week2.py::Qwen3ModelWeek2.__init__
 src/tiny_llm/models.py::dispatch_week3_batch_model
 ```
 
-Week 2 ends with course-owned quantized projections and tiled dense attention.
-The [Day 3 projection](./week2-03-simd-matrix-prefill.md) exposes its loader and
-SIMD-matrix operations. Week 3 teaches serving mechanisms,
-so it should not make every cache and scheduler measurement depend on that
-teaching kernel's remaining projection overhead.
+Week 2 ends with course-owned packed W4 CUDA projections and tiled dense
+attention. The [Day 3 projection](./week2-03-simd-matrix-prefill.md) exposes
+its loader and tensor-core WMMA operations. Week 3 also exposes a readable
+PyTorch projection control so you can verify or isolate serving mechanisms
+independently of the custom W4 kernels.
 
-Add a per-weight `use_mlx_quantized_linear` selector whose default remains
-`False`, preserving every Week 2 checkpoint. When selected,
-`quantized_linear` should call `mx.quantized_matmul` with the same packed
-weight, scales, biases, group size, bits, and transposed-weight convention.
-Then implement `dispatch_week3_batch_model` as the explicit construction seam:
-it builds the completed dense-cache Week 2 model with that selector enabled.
+Add a per-weight `use_torch_quantized_linear` selector on `QuantizedWeights`
+whose default remains `False`, preserving every Week 2 checkpoint. When
+selected, `quantized_linear` should call `torch_quantized_linear(x, w, bias)`,
+which materializes the dense weight matrix with `dequantize_weights` and calls
+`torch.nn.functional.linear` (adding the optional bias). Propagate
+`use_torch_quantized_linear` through `Qwen3ModelWeek2.__init__`, and implement
+`dispatch_week3_batch_model` as the explicit construction seam that builds the
+dense-cache Week 2 model (`dispatch_model(model_name, hf_model, week=2)`).
 
 Call this batch-ready model with several requests, one offset per batch
 element, and the mask returned by `BatchingKvCache`. Exercise requests joining
-and leaving at different positions. Only quantized projections cross the MLX
-seam; normalization, RoPE, activation, attention, cache state, and scheduling
-remain in your solution. The model remains request-agnostic; slot ownership and
-lifecycle belong to the cache and scheduler.
+and leaving at different positions. When `use_torch_quantized_linear=True`,
+only quantized projections cross the PyTorch projection seam; normalization,
+RoPE, activation, attention, cache state, and scheduling remain in your
+solution. The model remains request-agnostic; slot ownership and lifecycle
+belong to the cache and scheduler.
 
 Verify the projection seam and its batch-model factory with:
 
@@ -184,23 +187,17 @@ and their original `prompt_idx` values:
 pdm run test --week 3 --day 1 -- -k task_4
 ```
 
-Then run the complete scheduler against the real model:
+Then run the scheduler against a real Hugging Face checkpoint on CUDA (once
+`Qwen3ModelWeek3` is wired on Day 3, `--loader week3` runs `batch_generate`
+directly; the older `batch-main` and `bench-chunked-prefill` scripts remain
+historical MLX/Metal tools):
 
 ```bash
-pdm run batch-main --solution tiny_llm --loader week2
+pdm run main --loader week3 --solution tiny_llm \
+  --model Qwen/Qwen3-0.6B --max-seq-len 64 --batch-size 1
 ```
 
-By default, `batch-main` uses Qwen3-0.6B with a batch size of five and a fixed
-prompt set. Treat it as a product smoke: watch requests enter, decode, finish,
-and release their slots. Its shuffled prompt order and cumulative wall-clock
-display are not the source of a decode-gap measurement.
-
-Day 2's deterministic `bench-chunked-prefill` runner owns that comparison. Its
-512-token budget processes every prompt in a 64–512-token trace in one chunk,
-so it provides a Day 1 control for your new run. The table later in Day 2 uses
-the historical task #367 trace from source `18aec850`, not a result reproduced
-on this five-day Week 2 checkout. The runner records the exact token ids,
-output budget, seed, process order, and decode-completion gaps before Day 2
-changes the prefill budget.
+The table later in Day 2 uses the historical task #367 MLX/Metal trace from
+source `18aec850`, not a result reproduced on this PyTorch/CUDA checkout.
 
 {{#include copyright.md}}

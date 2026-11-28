@@ -1,23 +1,55 @@
-import mlx.core as mx
-from mlx_lm.tokenizer_utils import TokenizerWrapper
 from datetime import datetime
+from typing import Any
 
-from .kv_cache_mlx import BatchingKvCache
+import torch
+
+from .kv_cache import BatchingKvCache
+
+
+class _HFDetokenizer:
+    def __init__(self, tokenizer: Any):
+        self.tokenizer = tokenizer
+        self.tokens: list[int] = []
+
+    def reset(self) -> None:
+        self.tokens = []
+
+    def add_token(self, token: int) -> None:
+        self.tokens.append(int(token))
+
+    def finalize(self) -> None:
+        return None
+
+    @property
+    def text(self) -> str:
+        return self.tokenizer.decode(self.tokens)
+
+
+def _make_detokenizer(tokenizer: Any) -> Any:
+    if hasattr(tokenizer, "detokenizer") and hasattr(tokenizer, "_tokenizer"):
+        return tokenizer.detokenizer.__class__(tokenizer._tokenizer)
+    return _HFDetokenizer(tokenizer)
+
+
+def _model_device(model: Any) -> torch.device:
+    dev = getattr(model, "device", None)
+    if dev is not None:
+        return torch.device(dev)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def _step(model, y, offsets, kv_cache):
     logits = model(y, offsets, kv_cache, logits_to_keep=1)
-    logits = logits[:, -1, :]
-    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-    y = mx.argmax(logprobs, axis=-1)
-    return y
+    logits = logits[:, -1, :].float()
+    logprobs = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+    return torch.argmax(logprobs, dim=-1)
 
 
 class Request:
     def __init__(
         self,
-        model: any,
-        tokenizer: TokenizerWrapper,
+        model: Any,
+        tokenizer: Any,
         prompt: str,
         prefill_max_step: int = 128,
         prompt_idx: int = 0,
@@ -25,13 +57,16 @@ class Request:
     ):
         self.prompt = prompt
         self.model = model
-        self.detokenizer = tokenizer.detokenizer.__class__(tokenizer._tokenizer)
-        self.prefill_tokens = mx.array(
-            tokenizer.encode(prompt, add_special_tokens=False)
+        self.device = _model_device(model)
+        self.detokenizer = _make_detokenizer(tokenizer)
+        self.prefill_tokens = torch.tensor(
+            tokenizer.encode(prompt, add_special_tokens=False),
+            dtype=torch.long,
+            device=self.device,
         )
-        if max_seq_len is not None and self.prefill_tokens.size > max_seq_len:
+        if max_seq_len is not None and self.prefill_tokens.numel() > max_seq_len:
             raise ValueError(
-                f"Prompt has {self.prefill_tokens.size} tokens, which exceeds "
+                f"Prompt has {self.prefill_tokens.numel()} tokens, which exceeds "
                 f"max_seq_len={max_seq_len}"
             )
         self.kv_cache = model.create_kv_cache()
@@ -52,7 +87,7 @@ class Request:
         if self.is_prefill_done:
             raise ValueError("prefill called after done")
         tokens_to_prefill = min(
-            self.prefill_max_step, self.prefill_tokens.size - self.offset
+            self.prefill_max_step, self.prefill_tokens.numel() - self.offset
         )
         token = _step(
             self.model,
@@ -62,18 +97,15 @@ class Request:
         )
         self.offset += tokens_to_prefill
 
-        # Materialize KV cache after each prefill chunk to truncate the lazy
-        # computation graph and prevent memory from growing unboundedly.
         for layer_cache in self.kv_cache:
             layer_cache.materialize()
-        if self.offset == self.prefill_tokens.size:
+        if self.offset == self.prefill_tokens.numel():
             self.is_prefill_done = True
-            mx.eval(token)
             if self.max_seq_len is not None and self.offset >= self.max_seq_len:
                 self.is_done = True
                 self.finish_reason = "max seq len"
             else:
-                self.decode_done(token.item(), False)
+                self.decode_done(int(token.item()), False)
 
     def decode_done(self, token, update_offset=True):
         if self.is_done:
@@ -91,8 +123,6 @@ class Request:
         return self.detokenizer.text
 
     def reaches_max_seq_len(self, max_seq_len: int) -> bool:
-        # next_token has been emitted to the detokenizer but is not in the KV
-        # cache yet, so it occupies the position immediately after offset.
         return self.next_token is not None and self.offset + 1 >= max_seq_len
 
 
@@ -123,23 +153,25 @@ def _print_progress(
             )
             return
         percentage = (
-            pending_prefill_request.offset / pending_prefill_request.prefill_tokens.size
+            pending_prefill_request.offset
+            / pending_prefill_request.prefill_tokens.numel()
         ) * 100
         print(
-            f"{animation_frame} Prefill [req {pending_prefill_request.prompt_idx}]: {percentage:.2f}% ({pending_prefill_request.prefill_tokens.size - pending_prefill_request.offset} remaining tokens)",
+            f"{animation_frame} Prefill [req {pending_prefill_request.prompt_idx}]: {percentage:.2f}% ({pending_prefill_request.prefill_tokens.numel() - pending_prefill_request.offset} remaining tokens)",
             flush=True,
         )
     else:
         print(f"  Prefill: idle, {queue_size} requests in queue", flush=True)
 
 
+@torch.inference_mode()
 def batch_generate(
-    model: any,
-    tokenizer: TokenizerWrapper,
+    model: Any,
+    tokenizer: Any,
     prompts: list[str],
-    max_seq_len=512,
-    batch_size=5,
-    prefill_step=128,
+    max_seq_len: int = 512,
+    batch_size: int = 5,
+    prefill_step: int = 128,
 ):
     if max_seq_len <= 0:
         raise ValueError("max_seq_len must be positive")
@@ -148,6 +180,7 @@ def batch_generate(
     if prefill_step <= 0:
         raise ValueError("prefill_step must be positive")
 
+    device = _model_device(model)
     prompts = list(prompts)
     decode_requests: list[Request | None] = [None] * batch_size
     kv_cache = [
@@ -168,7 +201,6 @@ def batch_generate(
                 and all(req is None for req in decode_requests)
             ):
                 break
-            # prefill until no idle slots
             if len(prompts) > 0 and pending_prefill_request is None:
                 prompt = prompts.pop(0)
                 pending_prefill_request = Request(
@@ -181,7 +213,6 @@ def batch_generate(
                 )
                 next_request_idx += 1
 
-            # In every iteration, we do a prefill first
             if pending_prefill_request is not None:
                 made_progress = False
                 if not pending_prefill_request.is_prefill_done:
@@ -204,7 +235,6 @@ def batch_generate(
                         found_slot = False
                         for i in range(batch_size):
                             if decode_requests[i] is None:
-                                # Add this request to the decode requests
                                 for prefill_cache, batch_cache in zip(
                                     prefill_kv_cache, kv_cache
                                 ):
@@ -225,7 +255,6 @@ def batch_generate(
                     )
                     progress_cnt += 1
 
-            # After the prefill request moves forward one step, we do the decode
             if any(req is not None for req in decode_requests):
                 next_tokens = []
                 offsets = []
@@ -236,15 +265,14 @@ def batch_generate(
                     else:
                         next_tokens.append(0)
                         offsets.append(0)
-                next_tokens = mx.array(next_tokens)
-                # decode
-                next_tokens = _step(
-                    model, next_tokens.reshape(-1, 1), offsets, kv_cache
-                )
+                next_tokens_t = torch.tensor(
+                    next_tokens, dtype=torch.long, device=device
+                ).reshape(-1, 1)
+                next_tokens_t = _step(model, next_tokens_t, offsets, kv_cache)
                 for i in range(batch_size):
                     req = decode_requests[i]
                     if req is not None:
-                        req.decode_done(next_tokens[i].item())
+                        req.decode_done(int(next_tokens_t[i].item()))
                         remove_reason = None
                         if req.is_done:
                             remove_reason = req.finish_reason
@@ -269,8 +297,6 @@ def batch_generate(
                 )
                 progress_cnt += 1
     finally:
-        # A request cache may be present both in pending_prefill_request and in
-        # a partially populated batch slot. Release each live cache object once.
         live_caches = {}
         if pending_prefill_request is not None:
             for request_cache in pending_prefill_request.kv_cache:

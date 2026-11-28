@@ -142,21 +142,24 @@ one-token query and a long prompt. Use these design rules:
 
 1. Preserve the Week 2 BF16 model boundary and reuse its internal accumulation
    policy unchanged.
-2. For short queries, expose parallelism across the cached context. Do not
-   reserve most of a threadgroup for query rows that do not exist.
+2. For short queries, expose parallelism across the cached context or head
+   dimension. Do not reserve most of a thread block for query rows that do not
+   exist.
 3. For prefill, begin with a direct page-walking schedule whose address
    calculation is easy to validate.
-4. Use the readable equation written with `mlx.core` and the dense Week 2
-   attention kernel in your solution as correctness oracles for the new
-   page-walking schedule.
+4. Use the readable PyTorch equation (`scaled_dot_product_attention_grouped`)
+   and the dense Week 2 attention kernel in your solution as correctness
+   oracles for the new page-walking schedule.
 
-The reference solution uses this optional split. Treat its threshold as a
-value to verify on your hardware, not part of the public checkpoint:
+The CUDA reference uses a single warp-based direct page-walking kernel
+(`paged_attention_direct_kernel`, one 32-thread warp per `(batch, head, query_row)`)
+for all generic and decode shapes on Day 4, and adds a tiled BF16 `D == 128`
+long-prefill kernel (`paged_attention_tiled_bf16_d128_kernel`) on Day 5:
 
-| Shape | Dispatch in your solution | Work decomposition |
+| Shape | Schedule in CUDA reference | Work decomposition |
 |---|---|---|
-| `L <= 8` | Vector paged decode | One threadgroup per query row; 32 SIMD groups stride over the context and merge partial `(max, sum, output)` states. |
-| `L > 8` | Scalar direct paged prefill | Walk logical K/V tiles through the block table and keep the schedule deliberately inspectable. Day 5 optimizes the supported BF16 hot case. |
+| Day 4 (all shapes) and Day 5 fallback (`L <= 8`, non-BF16, or `D != 128`) | Direct warp paged attention | One 32-thread warp per `(batch, head, query_row)` walks logical K/V positions through `block_table` with online softmax in FP32. |
+| Day 5 hot case (`L > 8`, BF16, `D == 128`) | Tiled paged FlashAttention | Shared-memory BQ4/BK16 tile staging across logical page boundaries with 4 warps (128 threads) per block. |
 
 If you make a shape decision, put it at the extension boundary rather than
 converting inputs or falling back to dense attention in Python. Keep the
@@ -175,7 +178,7 @@ def paged_attention(...):
     ...
 ```
 
-In your solution, make it a correctness-first page-walking Metal operation
+In your solution, make it a correctness-first page-walking CUDA operation
 with online softmax. It may use one kernel or several internal schedules:
 
 1. use `block_table[b]` to find the physical pages for request `b`,
@@ -197,10 +200,11 @@ tail-page boundary errors are visible. Day 5 will tile its inner matrix work
 while preserving this address calculation.
 
 For performance, one-token decode benefits from a different work decomposition.
-A 64-row prefill tile would leave almost every query row idle, so the reference
-dispatches short queries to a vector-oriented kernel that partitions the
-context across SIMD groups and merges their partial online-softmax states. This
-split is an optimization, not a public correctness requirement.
+A multi-row prefill tile would leave almost every query row idle, so short
+queries work well with a warp-per-query schedule that keeps the query in
+registers and reduces dot products across lanes with warp shuffles. Splitting
+decode and long prefill is an optimization, not a public correctness
+requirement.
 
 The page pool should therefore expose contiguous physical storage:
 
@@ -328,29 +332,19 @@ pdm run test --week 3 --day 4 -- -k task_1
 
 ```
 src/tiny_llm/attention.py
-src/extensions/src/paged_attention.cpp
-src/extensions/src/paged_attention.metal
+src/cuda/student.cu
+src/cuda/bindings.cpp     (already wired)
+src/tiny_llm/cuda_ops.py  (already wired)
 ```
 
 Modify the stable starter boundary:
 
-- `paged_attention` in `src/tiny_llm/attention.py`;
-- `tiny_llm_ext::paged_attention`, `PagedAttention::eval_cpu`, and
-  `PagedAttention::eval_gpu` in `src/extensions/src/paged_attention.cpp`;
-- one or more kernels in `src/extensions/src/paged_attention.metal` that
-  implement the same public behavior. The starter names
-  `paged_attention_decode` and `paged_attention_scalar_f32` mirror the
-  reference design, but they are not required by the tests.
-
-This checkpoint also turns the already-readable quantized token lookup into
-the Week 3 one-dispatch path. Modify `QuantizedEmbedding.__call__` in
-`src/tiny_llm/embedding.py`, `tiny_llm_ext::quantized_embedding` plus
-`QuantizedEmbedding::eval_cpu`/`eval_gpu` in
-`src/extensions/src/quantized_matmul.cpp`, and
-`quantized_embedding_w4a16_g128` in
-`src/extensions/src/quantized_matmul.metal`. The starter declarations,
-bindings, stubs, and build registrations for both operations already exist and
-remain fail-closed until you replace them.
+- `paged_attention` in `src/tiny_llm/attention.py`, which validates the paged
+  metadata and delegates to `cuda_ops.paged_attention`;
+- `paged_attention_cuda` and its CUDA kernel(s) in `src/cuda/student.cu`
+  (already bound in `src/cuda/bindings.cpp` and wrapped in
+  `src/tiny_llm/cuda_ops.py`). The starter stub remains fail-closed until you
+  replace it.
 
 Add a paged attention interface whose inputs come from the paged runtime rather
 than a dense reconstructed `S` dimension. Preserve the Week 2 precision
@@ -368,28 +362,21 @@ After all visible pages are consumed, divide `output` by `running_sum`.
 This is the key idea that lets the kernel avoid materializing dense K/V while
 still producing the same result as dense attention.
 
-The reference solution implements two correctness-first GPU dispatches:
+In the CUDA reference, one correctness-first kernel
+(`paged_attention_direct_kernel<T>`) serves both float32 and BF16 for all query
+lengths: launch one 32-thread warp per `(batch, head, query_row)`, accumulate
+dot products across the 32 lanes with warp shuffles (`__shfl_xor_sync`), keep
+the online-softmax `(m, l)` state and output accumulator in FP32, and translate
+each logical key index `s` through `block_table[b, s / page_size]` and
+`s % page_size`. Guard the device with `c10::cuda::CUDAGuard`, launch on
+`at::cuda::getCurrentCUDAStream()`, and check with
+`C10_CUDA_KERNEL_LAUNCH_CHECK()`. Favor inspectable page ownership over the
+final tiled performance schedule; Day 5 is where the supported BF16
+long-prefill region receives a dedicated tiled implementation.
 
-1. For `L <= 8`, partition logical context positions across SIMD groups and
-   merge their partial `(max, sum, output)` states in threadgroup memory. The
-   initial schedule uses 32 SIMD groups per query. Resolve the physical page
-   once, then let group `g` visit slots `g`, `g + 32`, `g + 64`, and so on
-   within that page; do not divide and reload `block_table` for every token.
-2. For longer queries, it assigns query rows to a direct page-walking schedule
-   and resolves every K/V tile through `block_table`. When a tile is aligned and
-   cannot cross a page boundary, share its one physical page id across the
-   whole tile. Its direct schedule handles both float32 and BF16, using float
-   accumulators for BF16's dot products, online-softmax state, and output
-   accumulation.
-
-You may instead reuse one correct direct kernel for every query length. Favor
-inspectable page ownership over the final tiled performance schedule; Day 5 is
-where the supported BF16 long-prefill region receives a dedicated performance
-implementation.
-
-Compare small deterministic fixtures with the readable equation written with
-`mlx.core` and the dense Week 2 attention path before tuning the page-walking
-schedule.
+Compare small deterministic fixtures with the readable PyTorch equation
+(`scaled_dot_product_attention_grouped`) and the dense Week 2 attention path
+before tuning the page-walking schedule.
 
 Rebuild the extension, then use the BF16 long-prefill checkpoint as the first
 feedback loop for this task:
@@ -402,9 +389,9 @@ pdm run test --week 3 --day 4 -- -k task_2_bfloat16_long_prefill
 The focused checkpoint constructs valid page metadata directly. It checks a
 nine-token prefill and a longer multi-page prefill with noncontiguous physical
 pages, poisoned unused tail slots, and causal prefix masking. It does not
-require the quantized embedding, model dispatch, continuous batching, or the
-Day 5 kernel. Kernel names and implementation structure are not part of the
-test contract; only the public numerical, metadata, and dtype behavior is.
+require model dispatch, continuous batching, or the Day 5 kernel. Kernel names
+and implementation structure are not part of the test contract; only the public
+numerical, metadata, and dtype behavior is.
 
 `paged_attention` must also reject bad metadata with `ValueError` before it
 dispatches any kernel, because a kernel given a wrong page id reads another
@@ -419,41 +406,32 @@ request's K/V or memory outside the pool. Check that:
 - an active row (`context_len > 0`) holds at least as many tokens as the query
   has rows, `L`.
 
-With the batch metadata from Task 1, run the remaining Task 2 checks, the
-metadata validation, and the Week 3 quantized embedding:
+With the batch metadata from Task 1, run the remaining Task 2 checks and the
+metadata validation:
 
 ```bash
 pdm run test --week 3 --day 4 -- -k task_2
 pdm run test --week 3 --day 4 -- -k rejects
-pdm run test --week 3 --day 4 -- -k custom_embedding
 ```
 
 Rerun `-k task_1` from Task 1 now as well; it needs this operator.
 
-For the reference Qwen decode schedule, specialize BF16 `D = 128`: each lane owns
-four contiguous dimensions of Q, K, V, and the output. After all context
-positions are visited, transpose the 32 partial output vectors through one
-compact 32×32 threadgroup tile. Each SIMD group then reduces four dimensions
-with `simd_sum`. This organizes the reduction in 4.25 KiB of scratch instead
-of storing one full partial vector per scalar output thread. Keep a generic
-BF16 specialization for other head dimensions so the optimization cannot
-silently reinterpret `D = 32` as `D = 128`.
-
-Day 4 must work without a future tiled/cooperative/MMA kernel. A dedicated
-prefill kernel is optional here: reusing the direct decode implementation for
-long queries is valid when it preserves the public behavior. Day 5 may replace
-only the internal supported BF16 long-query region while preserving the same
-API, generic fallback, and page-table semantics.
+Day 4 must work without a future tiled/MMA kernel. A dedicated prefill kernel
+is optional here: reusing the direct warp kernel for long queries is valid when
+it preserves the public behavior. Day 5 may replace only the internal supported
+BF16 long-query region while preserving the same API, generic fallback, and
+page-table semantics.
 
 ### Your solution's boundary
 
 The walkthrough keeps page translation and online softmax in a course-owned
-Metal operation so you can inspect them. The public checkpoint does not grade
+CUDA operation so you can inspect them. The public checkpoint does not grade
 an internal helper, tile, symbol, or library choice: a behaviorally equivalent
 implementation or external low-level library is valid. To preserve the
 chapter's systems outcome, the completed operator still consumes page storage
-and its block table directly rather than rebuilding dense K/V in Python. MLX
-SDPA remains a useful correctness oracle and performance baseline.
+and its block table directly rather than rebuilding dense K/V in Python.
+PyTorch SDPA (`torch.nn.functional.scaled_dot_product_attention`) remains a
+useful correctness oracle and performance baseline.
 
 Both prefill and decode read page storage through this interface. Do not add a
 dense-only special case: Day 5 optimizes this same paged contract.
@@ -465,25 +443,23 @@ src/tiny_llm/qwen3_week3.py
 ```
 
 Modify `Qwen3MultiHeadAttention.__call__`, `Qwen3ModelWeek3.__init__`, and
-`Qwen3ModelWeek3.__call__` to select the paged path and enable the custom
-embedding only at this cumulative checkpoint.
+`Qwen3ModelWeek3.__call__` to select the paged path when
+`enable_paged_attention=True` (the default).
 
-Update the model so it can route to paged attention when the cache provides paged runtime metadata.
+Update the model so it routes to paged attention when the cache provides paged
+runtime metadata.
 
 Append K/V to the page pool and pass its metadata to attention for every query
-shape. The reference uses scalar prefill and vector decode schedules, but one
-correct direct schedule may serve both. Neither choice changes cache dtype or
-gathers a dense K/V tensor.
+shape. Neither choice changes cache dtype or gathers a dense K/V tensor.
 
 This creates the Day 4 routing policy:
 
 ```plain
 every query shape -> correct direct page-walking attention
-optional split -> scalar prefill and vector decode
 ```
 
 Day 5 replaces the long-query schedule with paged FlashAttention without
-changing this model-facing policy. `--disable-paged-attention` is a Day 4
+changing this model-facing policy. `enable_paged_attention=False` is a Day 3
 dense-gather teaching ablation, not the completed serving path.
 
 This test decodes incrementally through the Week 3 model and compares each
@@ -511,11 +487,11 @@ Update request admission, slot reuse, and request removal so that:
 - active decode steps reuse page metadata instead of rebuilding dense K/V.
 
 Day 4's tests do not exercise this scheduler wiring. To see it end to end,
-run the real model through your paged scheduler and watch requests enter,
-decode, finish, and free their slots:
+run the real model through your paged scheduler on CUDA:
 
 ```bash
-pdm run batch-main --solution tiny_llm --loader week3
+pdm run main --loader week3 --solution tiny_llm \
+  --model Qwen/Qwen3-0.6B --max-seq-len 64 --batch-size 1
 ```
 
 After this chapter, the serving stack has the right structure for a real high-throughput runtime: paging is no longer just a storage trick, but part of the execution model itself.
@@ -533,32 +509,21 @@ Record three operator baselines on the same machine:
 1. the dense Week 2 attention path in your solution, including any required
    K/V gather,
 2. your direct paged-attention path,
-3. the MLX attention path as a production-library baseline.
+3. PyTorch SDPA (`torch.nn.functional.scaled_dot_product_attention`) as a
+   production-library baseline.
 
-Use the same Qwen3-4B decode shape for all three paths. The dense control must
+Use the same Qwen3-4B decode shape for all three paths with explicit
+`torch.cuda.synchronize()` around timed iterations. The dense control must
 include its required page-to-dense gather; the direct path reads the same page
-metadata; the MLX row measures its fused attention operator on the already
-gathered tensor:
+metadata; the PyTorch SDPA row measures its fused attention operator on the
+already gathered tensor. (The older `bench-week3-attention` script remains a
+historical MLX/Metal benchmark.)
 
-```bash
-week3_result_root="$HOME/tiny-llm-week3-results"
-mkdir -p "$week3_result_root"
-week3_result_dir="$(mktemp -d "$week3_result_root/run-XXXXXX")"
-
-pdm run bench-week3-attention --solution tiny_llm --offline --contexts 128 1024 \
-  --page-size 128 --warmup 5 --iterations 60 --repeats 4 \
-  --cooldown-seconds 1 \
-  --json-output "$week3_result_dir/attention-tiny-llm.json"
-```
-
-This command measures your `tiny_llm` operators into a new JSON file outside
-the tracked historical corpus. For a current reference control, use the same
-flags with `--solution ref` and a different filename in the new directory.
-The table below instead records historical task #367 results from source
+The table below records historical task #367 MLX/Metal results from source
 `18aec8503929d80c986324578068ecac2463c2ac`: medians of four balanced
 fresh-process medians, with 60 synchronized calls after five warmups per
-process. A current run measures this checkout; it need not reproduce those
-values.
+process. A current CUDA run will produce different values; it need not
+reproduce those numbers.
 
 | Context | Dense + gather | Direct paged | MLX fused |
 |---:|---:|---:|---:|
@@ -591,12 +556,12 @@ Optimize for the one-token decode shape instead of treating page traversal as a
 serial loop. Work through these changes one at a time and benchmark after each
 one:
 
-1. assign the lanes of a SIMD group to adjacent elements of a head so K/V loads
+1. assign the lanes of a warp to adjacent elements of a head so K/V loads
    can be coalesced,
 2. load a page-table entry once and reuse it for all positions in that page,
 3. keep the query and online-softmax state in registers across page tiles,
-4. combine partial dot products with SIMD reductions instead of threadgroup
-   scratch memory and repeated barriers,
+4. combine partial dot products with warp shuffle reductions (`__shfl_xor_sync`)
+   instead of shared memory and repeated barriers,
 5. specialize the `L = 1` decode case so it does not carry prefill control flow,
 6. prepare the batch's page metadata once per scheduler step rather than once
    per layer or attention head.
@@ -622,7 +587,7 @@ end-to-end workload with requests entering and leaving the batch, then report:
 - peak KV-cache memory and the number of live requests admitted,
 - bytes or time spent gathering and repacking K/V,
 - paged-attention latency relative to the dense Week 2 path in your solution
-  and MLX.
+  and PyTorch SDPA.
 
 Keep the dense path as a teaching ablation so you can measure when contiguous
 attention is faster. The completed serving route stays paged: it eliminates
@@ -631,42 +596,19 @@ headroom in the fixed-batch trace. Proving that it admits more concurrent
 requests requires a memory-capped admission sweep. Day 5 optimizes its
 long-prefill schedule rather than routing around the page-table contract.
 
-Use the paired serving runner rather than a preallocated static request:
-
-```bash
-week3_result_root="$HOME/tiny-llm-week3-results"
-mkdir -p "$week3_result_root"
-week3_result_dir="$(mktemp -d "$week3_result_root/run-XXXXXX")"
-
-pdm run bench-serving-progression --solution tiny_llm --offline --repeats 4 \
-  --model qwen3-4b --num-seqs 16 --batch-size 4 \
-  --min-input-len 128 --max-input-len 1024 \
-  --min-output-len 32 --max-output-len 128 --prefill-step 128 \
-  --warmup 1 --cooldown-seconds 1 \
-  --json-output "$week3_result_dir/serving-tiny-llm.json"
-```
-
-This command compares your Week 2 dense batch reconstruction, Week 3 paged
-storage with the
-dense-gather compatibility path, and Week 3 direct paged attention. All three
-course rows use the same MLX quantized-projection seam; they differ in KV
-representation and attention path. The runner resets page capacity after
-warmup and reports prefill, output, and decode throughput alongside peak KV
-bytes, copy volume, page reuse, and tail fragmentation. It writes a new JSON
-file outside the tracked historical corpus. The numbers that follow are from
-task #367 on predecessor source `18aec8503929d80c986324578068ecac2463c2ac`;
-they do not describe today's five-day Week 2 baseline. The direct path's
-four-process medians are 672.68 prefill tok/s, 46.36 output tok/s, 105.01 decode
-tok/s, and 0.618 requests/s. Its synchronized decode calls take
+(The older `bench-serving-progression` runner remains a historical MLX/Metal
+script.) The numbers that follow are from historical task #367 on predecessor
+MLX/Metal source `18aec8503929d80c986324578068ecac2463c2ac`; they do not
+describe today's PyTorch/CUDA checkout. The direct path's
+four-process medians were 672.68 prefill tok/s, 46.36 output tok/s, 105.01
+decode tok/s, and 0.618 requests/s. Its synchronized decode calls took
 28.97/36.78/63.04 ms at median/p95/max; the completion gaps, which include
-intervening scheduler and prefill work, are 30.16/222.18/239.49 ms.
+intervening scheduler and prefill work, were 30.16/222.18/239.49 ms.
 
 Those are historical cumulative system results, not an isolated Day 4 kernel
 speedup. The ledger at
 `benchmark_results/task367-final-main/task367-final-main-benchmark-ledger.md`
 records the fixed trace, balanced process order, and denominator boundary.
-For a current reference comparison, rerun with `--solution ref` and a new
-filename in your output directory; do not overwrite the predecessor JSON.
 
 ```bash
 pdm run test --week 3 --day 4

@@ -184,3 +184,37 @@ class TinyKvFullCache(TinyKvCache):
     def release(self):
         self.key_values = None
         self.offset = 0
+
+
+class BatchingKvCache(TinyKvCache):
+    def __init__(self, max_active_requests: int, max_seq_len: int | None = None):
+        self.max_active_requests = max_active_requests
+        self.max_seq_len = max_seq_len
+        self.kv_caches: list[TinyKvCache | None] = [None] * max_active_requests
+        self.HD = None
+        self.last_batch_bytes = 0
+        self.staging_copy_bytes = 0
+
+    def update_and_fetch(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        mask_length: int | None = None,
+        mask: torch.Tensor | str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, int | None, torch.Tensor | None]:
+        raise NotImplementedError("Week 3 Day 1: implement BatchingKvCache")
+
+    def update_and_fetch_paged(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        mask_length: int | None = None,
+        mask: torch.Tensor | str | None = None,
+    ) -> "PagedKvMetadata":
+        raise NotImplementedError("Week 3 Day 3: implement paged BatchingKvCache")
+
+    def add_request(self, prefilled: TinyKvCache, id: int):
+        raise NotImplementedError("Week 3 Day 1: implement add_request")
+
+    def remove_request(self, id: int):
+        raise NotImplementedError("Week 3 Day 1: implement remove_request")

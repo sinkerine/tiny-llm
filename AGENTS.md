@@ -12,7 +12,7 @@
 
 ## Environment Requirements
 
-- This branch targets Linux/CUDA for Weeks 1–2; see `CUDA.md`.
+- This branch targets Linux/CUDA for Weeks 1–3; see `CUDA.md`.
 - Keep all student exercises unfinished. Port existing reference solutions only.
 - Enter `nix develop` (or use direnv), then install dependencies:
 
@@ -21,11 +21,13 @@ uv sync --locked
 pdm run check-installation
 ```
 
-- Weeks 3–4 retain MLX/Metal and are outside the CUDA test scope.
-- Week 2 uses PyTorch and native C++/CUDA extensions. Day 1 needs no native build.
-- Before native Day 2–5 tests, run `nix develop --command pdm run build-ext-ref`
-  for reference checks and `pdm run build-ext` for learner checks. The latter
-  builds fail-closed learner stubs until the student implements them.
+- Week 4 retains MLX/Metal and is outside the CUDA test scope.
+- Weeks 2–3 use PyTorch and native C++/CUDA extensions. Week 2 Day 1 and Week 3
+  Days 1–2 need no new native kernels beyond Week 2.
+- Before native Week 2 Day 2–5 and Week 3 Day 3–5 tests, run
+  `nix develop --command pdm run build-ext-ref` for reference checks and
+  `pdm run build-ext` for learner checks. The latter builds fail-closed learner
+  stubs until the student implements them.
 - CUDA extension builds use one compiler worker by default and store outputs at
   `${XDG_CACHE_HOME:-$HOME/.cache}/dev-scratch/tiny-llm/cuda-week2/{reference,student}/`.
   Rebuild and cleanup use these same directories; never delete them during an active build.

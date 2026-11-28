@@ -1,9 +1,9 @@
-# Weeks 1–2 on CUDA
+# Weeks 1–3 on CUDA
 
-Weeks 1–2 use PyTorch tensors on Linux with an NVIDIA GPU. Student tasks in
+Weeks 1–3 use PyTorch tensors on Linux with an NVIDIA GPU. Student tasks in
 `src/tiny_llm` remain exercises; completed reference implementations are in
-`src/tiny_llm_ref`. Week 2 uses native C++/CUDA kernels. Weeks 3–4 remain
-historical MLX/Metal routes and are outside this port. CUDA package imports
+`src/tiny_llm_ref`. Weeks 2–3 use native C++/CUDA kernels. Week 4 remains
+historical MLX/Metal and is outside this port. CUDA package imports
 do not import MLX or eagerly build native extensions.
 
 ## Environment
@@ -178,6 +178,22 @@ by those teaching operators. See [the profiling chapter](book/src/week2-profile-
 Historical MLX capture/private Apple decoder scripts remain separate;
 `source-costs-week2-metal` is an optional macOS-only tool.
 
-The original Apple CLI remains in `scripts/main_mlx.py`. `main.py --loader week3`
-selects it; Week 3 still requires its original dependencies in a separate environment.
-Preserved `*_mlx.py` Week 2 modules support that historical backend.
+## Week 3 CUDA serving & paged attention
+
+Week 3 runs on the same PyTorch/CUDA runtime and native extension (`src/cuda/bindings.cpp`, `src/cuda/reference.cu`, `src/cuda/student.cu`):
+
+- **Days 1–2**: Continuous batching (`BatchingKvCache`, `Request`, `batch_generate`) and chunked prefill on PyTorch/CUDA with Hugging Face tokenizers.
+- **Day 3**: Paged KV cache (`TinyKvPagedPool`, `TinyKvPagedCache`, `PagedKvMetadata`) backed by `paged_cache_update_cuda` (in-place slice write into `[P, Hkv, page_size, D]` float32/BF16 page storage).
+- **Days 4–5**: Direct and tiled FlashAttention paged attention (`paged_attention_cuda`) behind the `paged_attention` boundary:
+  - Generic/decode path (`paged_attention_direct_kernel`): warp online-softmax over arbitrary `D` in FP32/BF16 with GQA and bottom-right causal masking.
+  - Long-prefill path (`paged_attention_tiled_bf16_d128_kernel`): BQ4/BK16 shared-memory tile staging across logical page boundaries for BF16 `D=128`, `L>=9`.
+- **Days 6–7 (Optional)**: Grouped W4 MoE (`grouped_expert_linear`, `route_topk`, `Moe`, supporting 3D packed `[E, N, K/8]` expert weights) and speculative decoding (`speculative_generate` with cache `rewind`).
+
+```sh
+nix develop --command pdm run test-refsol --week 3 --day 1 -- -q
+# Repeat for Days 2–7.
+nix develop --command pdm run main --loader week3 --solution ref \
+  --model Qwen/Qwen3-0.6B --max-seq-len 64 --batch-size 1
+```
+
+The original Apple CLI remains in `scripts/main_mlx.py` for Week 4. Preserved `*_mlx.py` modules support that historical backend.

@@ -158,3 +158,57 @@ def qk_norm_rope(x, weight, offsets, eps, base):
             "fused QK norm/RoPE requires BF16 [1,1,8|32,128] and valid norm/offsets"
         )
     return extension().qk_norm_rope(x, weight, offsets, eps, base)
+
+
+def paged_cache_update(pages, chunk, page_id, start):
+    check(pages, chunk)
+    if (
+        pages.ndim != 4
+        or chunk.ndim != 4
+        or chunk.shape[0] != 1
+        or chunk.shape[1] != pages.shape[1]
+        or chunk.shape[3] != pages.shape[3]
+        or pages.dtype != chunk.dtype
+        or pages.dtype not in (torch.float32, torch.bfloat16)
+    ):
+        raise ValueError("paged_cache_update expects [P,H,page_size,D] and [1,H,S,D] f32/bf16")
+    if page_id < 0 or page_id >= pages.shape[0]:
+        raise ValueError("page_id out of range")
+    if start < 0 or start + chunk.shape[2] > pages.shape[2]:
+        raise ValueError("paged write out of page bounds")
+    return extension().paged_cache_update(pages, chunk, int(page_id), int(start))
+
+
+def paged_attention(
+    q, key_pages, value_pages, block_table, context_lens, page_size, scale, causal
+):
+    check(q, key_pages, value_pages, block_table, context_lens)
+    if (
+        q.ndim != 4
+        or key_pages.ndim != 4
+        or value_pages.shape != key_pages.shape
+        or block_table.ndim != 2
+        or context_lens.ndim != 1
+        or block_table.dtype != torch.int32
+        or context_lens.dtype != torch.int32
+        or q.dtype != key_pages.dtype
+        or q.dtype != value_pages.dtype
+        or q.dtype not in (torch.float32, torch.bfloat16)
+        or key_pages.shape[1] == 0
+        or q.shape[1] % key_pages.shape[1] != 0
+        or q.shape[3] != key_pages.shape[3]
+        or key_pages.shape[2] != page_size
+        or block_table.shape[0] != q.shape[0]
+        or context_lens.shape[0] != q.shape[0]
+    ):
+        raise ValueError("invalid paged_attention inputs")
+    return extension().paged_attention(
+        q,
+        key_pages,
+        value_pages,
+        block_table,
+        context_lens,
+        int(page_size),
+        float(scale),
+        bool(causal),
+    )

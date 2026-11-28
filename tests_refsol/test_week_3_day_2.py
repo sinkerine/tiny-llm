@@ -2,9 +2,9 @@
 
 from pathlib import Path
 
-import mlx.core as mx
 import numpy as np
 import pytest
+import torch
 
 if Path(__file__).parent.name == "tests_refsol":
     import tiny_llm_ref.batch as batch_runtime
@@ -66,8 +66,8 @@ class DenseCacheDouble:
         if self.key_values is None:
             keys, values = key, value
         else:
-            keys = mx.concat([self.key_values[0], key], axis=2)
-            values = mx.concat([self.key_values[1], value], axis=2)
+            keys = torch.cat([self.key_values[0], key], dim=2)
+            values = torch.cat([self.key_values[1], value], dim=2)
         self.key_values = (keys, values)
         self.offset = keys.shape[2]
         self.materialized = False
@@ -88,6 +88,7 @@ class DenseCacheDouble:
 
 class ChunkBoundaryModel:
     num_hidden_layers = 2
+    device = torch.device("cpu")
 
     def create_kv_cache(self):
         return [DenseCacheDouble() for _ in range(self.num_hidden_layers)]
@@ -98,17 +99,18 @@ class ChunkBoundaryModel:
         assert all(layer.offset == offset for layer in cache)
         assert all(layer.materialized for layer in cache)
 
-        values = inputs.astype(mx.float32).reshape(1, 1, inputs.shape[1], 1)
+        values = inputs.to(torch.float32).reshape(1, 1, inputs.shape[1], 1)
         accumulated_tokens = None
         for layer in cache:
             keys, _, _, _ = layer.update_and_fetch(values, values)
             if accumulated_tokens is None:
                 accumulated_tokens = keys[0, 0, :, 0]
 
-        positions = mx.arange(1, accumulated_tokens.shape[0] + 1, dtype=mx.float32)
-        next_token = int(mx.sum(accumulated_tokens * positions).item()) % 128
-        logits = mx.zeros((1, 1, 128), dtype=mx.float32)
-        return logits.at[..., next_token].add(1)
+        positions = torch.arange(1, accumulated_tokens.shape[0] + 1, dtype=torch.float32)
+        next_token = int((accumulated_tokens * positions).sum().item()) % 128
+        logits = torch.zeros((1, 1, 128), dtype=torch.float32)
+        logits[..., next_token] = 1.0
+        return logits
 
 
 @pytest.mark.parametrize(
@@ -149,26 +151,27 @@ def test_chunk_boundaries_match_full_prompt_and_materialize_every_layer(
 
 
 def test_nonzero_prefix_rectangular_mask_matches_one_shot_attention():
-    values = mx.array([2.0, 4.0, 6.0, 8.0, 10.0], dtype=mx.float32)
-    mask = causal_mask(L=2, S=5, dtype=mx.float32)
-    visible = mx.exp(mask)
-    chunked = mx.matmul(visible, values[:, None])[:, 0] / mx.sum(visible, axis=-1)
-    one_shot_final = mx.mean(values)
+    values = torch.tensor([2.0, 4.0, 6.0, 8.0, 10.0], dtype=torch.float32)
+    mask = causal_mask(L=2, S=5, dtype=torch.float32)
+    visible = torch.exp(mask)
+    chunked = torch.matmul(visible, values[:, None])[:, 0] / visible.sum(dim=-1)
+    one_shot_final = values.mean()
 
-    expected_mask = mx.array(
+    expected_mask = torch.tensor(
         [
-            [0.0, 0.0, 0.0, 0.0, -mx.inf],
+            [0.0, 0.0, 0.0, 0.0, -torch.inf],
             [0.0, 0.0, 0.0, 0.0, 0.0],
         ],
-        dtype=mx.float32,
+        dtype=torch.float32,
     )
-    np.testing.assert_allclose(np.array(mask), np.array(expected_mask))
-    np.testing.assert_allclose(np.array(chunked), np.array([5.0, 6.0]))
-    np.testing.assert_allclose(np.array(chunked[-1]), np.array(one_shot_final))
+    np.testing.assert_allclose(mask.numpy(), expected_mask.numpy())
+    np.testing.assert_allclose(chunked.numpy(), np.array([5.0, 6.0]))
+    np.testing.assert_allclose(chunked[-1].item(), one_shot_final.item())
 
 
 class SchedulerModel:
     num_hidden_layers = 2
+    device = torch.device("cpu")
 
     def __init__(self, release_probe=None, fail_at=None):
         self.fail_at = fail_at
@@ -176,19 +179,16 @@ class SchedulerModel:
         self.decode_advances = 0
 
     def create_kv_cache(self):
-        group = [
+        return [
             DenseCacheDouble(
                 release_probe=self.release_probe,
                 fail_materialize=self.fail_at == "materialize" and layer == 0,
             )
             for layer in range(self.num_hidden_layers)
         ]
-        return group
 
     def __call__(self, inputs, offsets, cache, logits_to_keep=1):
         assert logits_to_keep == 1
-        # Request prefill is a one-row call. This fake uses a two-slot batch so
-        # decode is distinguishable without depending on a concrete cache type.
         is_decode = inputs.shape[0] == 2
         if self.fail_at == "prefill" and not is_decode:
             raise RuntimeError("injected prefill failure")
@@ -196,9 +196,7 @@ class SchedulerModel:
             raise RuntimeError("injected decode failure")
 
         sequence_length = 1 if is_decode else inputs.shape[1]
-        values = inputs.astype(mx.float32).reshape(
-            inputs.shape[0], 1, sequence_length, 1
-        )
+        values = inputs.to(torch.float32).reshape(inputs.shape[0], 1, sequence_length, 1)
         for layer in cache:
             layer.update_and_fetch(values, values, mask_length=sequence_length)
 
@@ -221,7 +219,7 @@ class SchedulerModel:
             40: 99,
             51: 7,
         }
-        logits = mx.zeros((inputs.shape[0], 1, 100), dtype=mx.float32)
+        logits = torch.zeros((inputs.shape[0], 1, 100), dtype=torch.float32)
         for row, token in enumerate(input_tokens):
             if token == 24:
                 next_token = 99 if self.decode_advances >= 3 else 88
@@ -236,7 +234,6 @@ def test_active_decode_advances_between_long_prompt_chunks_and_results_are_order
 ):
     release_probe = CacheReleaseProbe()
     model = SchedulerModel(release_probe=release_probe)
-
     result = batch_runtime.batch_generate(
         model,
         FakeTokenizer(),
@@ -245,7 +242,6 @@ def test_active_decode_advances_between_long_prompt_chunks_and_results_are_order
         batch_size=2,
         prefill_step=2,
     )
-
     assert result == [(1, ""), (0, "1234")]
     release_probe.assert_all_released()
     capsys.readouterr()
@@ -259,7 +255,6 @@ def test_active_decode_advances_between_long_prompt_chunks_and_results_are_order
 def test_normal_completion_releases_every_request_cache(capsys, prompt, max_seq_len):
     release_probe = CacheReleaseProbe()
     model = SchedulerModel(release_probe=release_probe)
-
     result = batch_runtime.batch_generate(
         model,
         FakeTokenizer(),
@@ -268,7 +263,6 @@ def test_normal_completion_releases_every_request_cache(capsys, prompt, max_seq_
         batch_size=2,
         prefill_step=2,
     )
-
     assert result == [(0, "")]
     release_probe.assert_all_released()
     capsys.readouterr()
@@ -277,7 +271,6 @@ def test_normal_completion_releases_every_request_cache(capsys, prompt, max_seq_
 def test_oversized_prompt_leaves_no_owned_cache_live(capsys):
     release_probe = CacheReleaseProbe()
     model = SchedulerModel(release_probe=release_probe)
-
     with pytest.raises(ValueError):
         batch_runtime.batch_generate(
             model,
@@ -287,7 +280,6 @@ def test_oversized_prompt_leaves_no_owned_cache_live(capsys):
             batch_size=1,
             prefill_step=2,
         )
-
     release_probe.assert_all_released()
     capsys.readouterr()
 
@@ -311,7 +303,6 @@ def test_failures_release_every_owned_request_cache(capsys, failure_point):
         fail_at=None if failure_point == "detokenize" else failure_point,
     )
     tokenizer = FailingTokenizer() if failure_point == "detokenize" else FakeTokenizer()
-
     with pytest.raises(RuntimeError):
         batch_runtime.batch_generate(
             model,
@@ -321,6 +312,5 @@ def test_failures_release_every_owned_request_cache(capsys, failure_point):
             batch_size=2,
             prefill_step=2,
         )
-
     release_probe.assert_all_released()
     capsys.readouterr()

@@ -1,21 +1,20 @@
 from dataclasses import dataclass
 from typing import Optional
 
-import mlx.core as mx
+import torch
 
-from extensions_ref import tiny_llm_ext_ref
-
-from .kv_cache_mlx import TinyKvCache
+from . import cuda_ops
+from .kv_cache import TinyKvCache
 
 
 @dataclass
 class PagedKvMetadata:
-    key_pages: mx.array
-    value_pages: mx.array
-    block_table: mx.array
-    context_lens: mx.array
+    key_pages: torch.Tensor
+    value_pages: torch.Tensor
+    block_table: torch.Tensor
+    context_lens: torch.Tensor
     page_size: int
-    mask: mx.array | str | None = None
+    mask: torch.Tensor | str | None = None
 
 
 class TinyKvPagedPool:
@@ -29,8 +28,8 @@ class TinyKvPagedPool:
     def __init__(self, page_size: int = 128):
         assert page_size > 0
         self.page_size = page_size
-        self._key_pages: mx.array | None = None
-        self._value_pages: mx.array | None = None
+        self._key_pages: torch.Tensor | None = None
+        self._value_pages: torch.Tensor | None = None
         self.free_page_ids: list[int] = []
         self.used_page_ids: set[int] = set()
         self.num_allocated_pages = 0
@@ -40,13 +39,13 @@ class TinyKvPagedPool:
         self.copied_bytes_on_growth = 0
 
     @property
-    def key_pages(self) -> mx.array | None:
+    def key_pages(self) -> torch.Tensor | None:
         if self._key_pages is None:
             return None
         return self._key_pages[: self.num_pages]
 
     @property
-    def value_pages(self) -> mx.array | None:
+    def value_pages(self) -> torch.Tensor | None:
         if self._value_pages is None:
             return None
         return self._value_pages[: self.num_pages]
@@ -71,8 +70,8 @@ class TinyKvPagedPool:
             return 0
         return self._key_pages.nbytes + self._value_pages.nbytes
 
-    def validate_page_chunk(self, key: mx.array, value: mx.array) -> None:
-        if len(key.shape) != 4 or len(value.shape) != 4:
+    def validate_page_chunk(self, key: torch.Tensor, value: torch.Tensor) -> None:
+        if key.ndim != 4 or value.ndim != 4:
             raise ValueError("Paged K/V chunks must be 4D [1, H, S, D]")
         if key.shape != value.shape:
             raise ValueError("Paged K/V chunks must have the same shape")
@@ -81,26 +80,31 @@ class TinyKvPagedPool:
             raise ValueError("Paged request cache only supports one request")
         if H <= 0 or D <= 0 or S <= 0:
             raise ValueError("Paged K/V chunks must have positive valid dimensions")
-        if key.dtype != value.dtype or key.dtype not in (mx.float32, mx.bfloat16):
+        if key.dtype != value.dtype or key.dtype not in (torch.float32, torch.bfloat16):
             raise ValueError(
                 "Paged K/V chunks must have the same float32 or bfloat16 dtype"
             )
+        if key.device != value.device:
+            raise ValueError("Paged K/V chunks must be on the same device")
         if (self._key_pages is None) != (self._value_pages is None):
             raise ValueError("Paged K/V storage is incomplete")
         if self._key_pages is not None and self._value_pages is not None:
             expected_shape = (H, self.page_size, D)
             if self._key_pages.shape[1:] != expected_shape:
                 raise ValueError(
-                    "Paged K/V chunks must match the existing page storage shape"
+                    f"Paged K/V chunk shape {key.shape} does not match page storage "
+                    f"shape {self._key_pages.shape}"
                 )
-            if self._value_pages.shape != self._key_pages.shape:
-                raise ValueError("Paged key and value storage must have the same shape")
             if (
                 self._key_pages.dtype != key.dtype
                 or self._value_pages.dtype != value.dtype
             ):
                 raise ValueError(
                     "Paged K/V chunks must match the existing page storage dtype"
+                )
+            if self._key_pages.device != key.device:
+                raise ValueError(
+                    "Paged K/V chunks must match the existing page storage device"
                 )
 
     def _snapshot_state(self) -> tuple:
@@ -130,8 +134,6 @@ class TinyKvPagedPool:
         ) = state
 
     def allocate_page(self) -> int:
-        # The page id is allocated from a model-wide free list. In this teaching
-        # version, a layer cache owns the page until release/rewind returns it.
         if self.free_page_ids:
             page_id = self.free_page_ids.pop()
             self.reused_page_allocations += 1
@@ -141,7 +143,7 @@ class TinyKvPagedPool:
         self.used_page_ids.add(page_id)
         return page_id
 
-    def read_page(self, page_id: int) -> tuple[mx.array, mx.array]:
+    def read_page(self, page_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         if self._key_pages is None or self._value_pages is None:
             raise ValueError(f"Page {page_id} has no storage")
         if page_id >= self.num_pages:
@@ -151,7 +153,7 @@ class TinyKvPagedPool:
             self._value_pages[page_id : page_id + 1],
         )
 
-    def _ensure_page_storage(self, key: mx.array, value: mx.array) -> None:
+    def _ensure_page_storage(self, key: torch.Tensor, value: torch.Tensor) -> None:
         B, H, _, D = key.shape
         assert B == 1
 
@@ -164,9 +166,11 @@ class TinyKvPagedPool:
                 return
 
         new_capacity = max(4, self.num_pages, self.capacity * 2)
-        new_key_pages = mx.zeros((new_capacity, H, self.page_size, D), dtype=key.dtype)
-        new_value_pages = mx.zeros(
-            (new_capacity, H, self.page_size, D), dtype=value.dtype
+        new_key_pages = torch.zeros(
+            (new_capacity, H, self.page_size, D), dtype=key.dtype, device=key.device
+        )
+        new_value_pages = torch.zeros(
+            (new_capacity, H, self.page_size, D), dtype=value.dtype, device=value.device
         )
         self.storage_growths += 1
         if self._key_pages is not None and self._value_pages is not None:
@@ -197,8 +201,8 @@ class TinyKvPagedPool:
         self,
         page_id: int,
         start: int,
-        key: mx.array,
-        value: mx.array,
+        key: torch.Tensor,
+        value: torch.Tensor,
     ) -> None:
         self.validate_page_chunk(key, value)
         if key.shape[2] > self.page_size:
@@ -220,34 +224,32 @@ class TinyKvPagedPool:
         assert key.shape[3] == D
         assert 0 <= start <= capacity
 
-        self._key_pages = tiny_llm_ext_ref.paged_cache_update(
-            self._key_pages,
-            mx.contiguous(key),
-            page_id,
-            start,
-        )
-        self._value_pages = tiny_llm_ext_ref.paged_cache_update(
-            self._value_pages,
-            mx.contiguous(value),
-            page_id,
-            start,
-        )
+        if key.is_cuda:
+            self._key_pages = cuda_ops.paged_cache_update(
+                self._key_pages,
+                key.contiguous(),
+                page_id,
+                start,
+            )
+            self._value_pages = cuda_ops.paged_cache_update(
+                self._value_pages,
+                value.contiguous(),
+                page_id,
+                start,
+            )
+        else:
+            self._key_pages[page_id, :, start:end, :].copy_(key[0])
+            self._value_pages[page_id, :, start:end, :].copy_(value[0])
 
     def free_page(self, page_id: int) -> None:
         if page_id not in self.used_page_ids:
             raise ValueError(f"Page {page_id} is already free")
-        # Keep the page id stable. The stale K/V bytes can stay in the backing
-        # tensor because block_table/page_lens decide which slots are live.
         self.used_page_ids.remove(page_id)
         self.free_page_ids.append(page_id)
 
 
 class TinyKvPagedCache(TinyKvCache):
-    """Request-and-layer-local K/V cache backed by a layer page pool.
-
-    Each request gets one cache handle per transformer layer. Cache handles for
-    the same layer share a pool so pages can be recycled across requests.
-    """
+    """Request-and-layer-local K/V cache backed by a layer page pool."""
 
     def __init__(self, pool: TinyKvPagedPool):
         self.pool = pool
@@ -255,20 +257,20 @@ class TinyKvPagedCache(TinyKvCache):
         self.page_ids: list[int] = []
         self.page_lens: list[int] = []
         self.offset = 0
-        self._cached_block_table: mx.array | None = None
-        self._cached_block_table_key: tuple[tuple[int, ...], int] | None = None
+        self._cached_block_table: torch.Tensor | None = None
+        self._cached_block_table_key: tuple[tuple[int, ...], int, str] | None = None
 
     @property
     def num_pages(self) -> int:
         return len(self.page_ids)
 
     @property
-    def key_values(self) -> tuple[mx.array, mx.array] | None:
+    def key_values(self) -> tuple[torch.Tensor, torch.Tensor] | None:
         if self.offset == 0:
             return None
         return self.gather_dense()
 
-    def _append_chunk(self, key: mx.array, value: mx.array) -> None:
+    def _append_chunk(self, key: torch.Tensor, value: torch.Tensor) -> None:
         self.pool.validate_page_chunk(key, value)
         S = key.shape[2]
         cache_state = self._snapshot_state()
@@ -276,7 +278,6 @@ class TinyKvPagedCache(TinyKvCache):
         start = 0
 
         try:
-            # First fill the existing tail page if it has free slots.
             if self.page_ids and self.page_lens[-1] < self.page_size:
                 page_id = self.page_ids[-1]
                 page_start = self.page_lens[-1]
@@ -290,8 +291,6 @@ class TinyKvPagedCache(TinyKvCache):
                 self.page_lens[-1] += take
                 start += take
 
-            # Then allocate fresh pages for the remaining chunk. We only write
-            # the valid prefix; unused tail slots are ignored by page_lens.
             while start < S:
                 end = min(start + self.page_size, S)
                 page_id = self.pool.allocate_page()
@@ -311,7 +310,7 @@ class TinyKvPagedCache(TinyKvCache):
             self._restore_state(cache_state)
             raise
 
-    def validate_append(self, key: mx.array, value: mx.array) -> None:
+    def validate_append(self, key: torch.Tensor, value: torch.Tensor) -> None:
         self.pool.validate_page_chunk(key, value)
 
     def _snapshot_state(self) -> tuple:
@@ -332,10 +331,8 @@ class TinyKvPagedCache(TinyKvCache):
             self._cached_block_table_key,
         ) = state
 
-    def gather_dense(self) -> tuple[mx.array, mx.array]:
+    def gather_dense(self) -> tuple[torch.Tensor, torch.Tensor]:
         assert self.offset > 0
-        # Dense compatibility path for tests and older callers. The paged
-        # attention path uses block_table/context_lens instead of this gather.
         key_chunks = []
         value_chunks = []
         for page_id, page_len in zip(self.page_ids, self.page_lens):
@@ -346,43 +343,49 @@ class TinyKvPagedCache(TinyKvCache):
             value_chunks.append(value_page[:, :, :page_len, :])
         if len(key_chunks) == 1:
             return key_chunks[0], value_chunks[0]
-        return mx.concat(key_chunks, axis=2), mx.concat(value_chunks, axis=2)
+        return torch.cat(key_chunks, dim=2), torch.cat(value_chunks, dim=2)
 
     def update_and_fetch(
         self,
-        key: mx.array,
-        value: mx.array,
+        key: torch.Tensor,
+        value: torch.Tensor,
         mask_length: int | None = None,
-        mask: mx.array | str | None = None,
-    ) -> tuple[mx.array, mx.array, int, Optional[mx.array]]:
+        mask: torch.Tensor | str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, int, Optional[torch.Tensor]]:
         self._append_chunk(key, value)
-        # Keep the old dense interface for earlier callers. Paged attention
-        # uses update_and_fetch_paged so it can read pages directly.
         dense_key, dense_value = self.gather_dense()
         return dense_key, dense_value, self.offset, mask
 
-    def block_table(self, max_pages: int | None = None) -> mx.array:
+    def _device(self) -> torch.device:
+        if self.pool._key_pages is not None:
+            return self.pool._key_pages.device
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def block_table(self, max_pages: int | None = None) -> torch.Tensor:
         if max_pages is None:
             max_pages = self.num_pages
         assert max_pages >= self.num_pages
-        cache_key = (tuple(self.page_ids), max_pages)
+        device = self._device()
+        cache_key = (tuple(self.page_ids), max_pages, str(device))
         if (
             self._cached_block_table is not None
             and self._cached_block_table_key == cache_key
         ):
             return self._cached_block_table
         page_ids = self.page_ids + [-1] * (max_pages - self.num_pages)
-        self._cached_block_table = mx.array([page_ids], dtype=mx.int32)
+        self._cached_block_table = torch.tensor(
+            [page_ids], dtype=torch.int32, device=device
+        )
         self._cached_block_table_key = cache_key
         return self._cached_block_table
 
-    def context_lens(self) -> mx.array:
-        return mx.array([self.offset], dtype=mx.int32)
+    def context_lens(self) -> torch.Tensor:
+        return torch.tensor([self.offset], dtype=torch.int32, device=self._device())
 
     def paged_metadata(
         self,
         max_pages: int | None = None,
-        mask: mx.array | str | None = None,
+        mask: torch.Tensor | str | None = None,
     ) -> PagedKvMetadata:
         assert self.pool.key_pages is not None
         assert self.pool.value_pages is not None
@@ -397,19 +400,18 @@ class TinyKvPagedCache(TinyKvCache):
 
     def update_and_fetch_paged(
         self,
-        key: mx.array,
-        value: mx.array,
+        key: torch.Tensor,
+        value: torch.Tensor,
         mask_length: int | None = None,
-        mask: mx.array | str | None = None,
+        mask: torch.Tensor | str | None = None,
     ) -> PagedKvMetadata:
         self._append_chunk(key, value)
         return self.paged_metadata(mask=mask)
 
     def materialize(self):
         key_pages = self.pool.key_pages
-        value_pages = self.pool.value_pages
-        if key_pages is not None and value_pages is not None:
-            mx.eval(key_pages, value_pages)
+        if key_pages is not None and key_pages.is_cuda:
+            torch.cuda.synchronize(key_pages.device)
 
     def rewind(self, n: int):
         if not isinstance(n, int) or isinstance(n, bool) or not 0 <= n <= self.offset:
@@ -423,9 +425,6 @@ class TinyKvPagedCache(TinyKvCache):
 
         target_num_pages = (new_offset + self.page_size - 1) // self.page_size
         while len(self.page_ids) > target_num_pages:
-            # Whole pages beyond the new logical length return to the shared
-            # allocator. Stale suffix slots in the final page are ignored because
-            # page_lens defines the valid prefix and future writes overwrite them.
             page_id = self.page_ids.pop()
             self.page_lens.pop()
             self.pool.free_page(page_id)
@@ -435,8 +434,6 @@ class TinyKvPagedCache(TinyKvCache):
         self.offset = new_offset
 
     def release(self):
-        # Request completion returns every page owned by this layer cache to the
-        # model-level allocator. Other layer caches release their own pages.
         for page_id in self.page_ids:
             self.pool.free_page(page_id)
         self.page_ids.clear()

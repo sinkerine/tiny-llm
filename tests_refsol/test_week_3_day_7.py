@@ -9,7 +9,7 @@ import subprocess
 import sys
 from typing import Callable
 
-import mlx.core as mx
+import torch
 import numpy as np
 import pytest
 
@@ -138,14 +138,14 @@ class ScriptedModel:
 
     def __call__(self, tokens, offset, kv_cache, logits_to_keep=1):
         cache = kv_cache[0]
-        assert tokens.dtype == mx.int32
+        assert tokens.dtype == torch.int32
         assert offset == cache.offset
         token_ids = [int(token) for token in tokens.reshape(-1).tolist()]
         if isinstance(cache, FakeCache):
             cache.offset += len(token_ids)
         else:
             length = len(token_ids)
-            values = mx.zeros((1, 1, length, 4), dtype=mx.float32)
+            values = torch.zeros((1, 1, length, 4), dtype=torch.float32)
             cache.update_and_fetch(values, values)
 
         if not self.outputs:
@@ -164,7 +164,7 @@ class ScriptedModel:
         logits = np.full((1, len(output), 32), -1000.0, dtype=np.float32)
         for position, token_id in enumerate(output):
             logits[0, position, token_id] = 1000.0
-        return mx.array(logits)
+        return torch.tensor(logits, dtype=torch.float32)
 
 
 def _tokenizers() -> tuple[FakeTokenizer, FakeTokenizer]:
@@ -212,7 +212,7 @@ def test_zero_proposal_length_is_target_only_and_uses_int32_tokens():
 
     assert result == "AB"
     assert len(target.calls) == 3
-    assert all(call["dtype"] == mx.int32 for call in target.calls)
+    assert all(call["dtype"] == torch.int32 for call in target.calls)
     assert not draft.calls
     assert not draft.caches
     _assert_released(target)

@@ -326,6 +326,123 @@ __global__ void swiglu_kernel(
         static_cast<float>(silu_t) * static_cast<float>(up[idx]));
 }
 
+constexpr int kAttnBq = 4;
+constexpr int kAttnBk = 16;
+constexpr int kAttnHeadDim = 128;
+constexpr int kAttnThreads = kAttnBq * 32;
+constexpr int kAttnElemPerLane = kAttnHeadDim / 32;
+
+__global__ void tiled_prefill_attention_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    const float* __restrict__ mask,
+    __nv_bfloat16* __restrict__ out,
+    int64_t Hq,
+    int64_t Hkv,
+    int64_t L,
+    int64_t S,
+    float scale,
+    bool causal) {
+    int tid = threadIdx.x;
+    int warp_id = tid >> 5;
+    int lane = tid & 31;
+
+    int64_t bhq = static_cast<int64_t>(blockIdx.y);
+    int64_t b = bhq / Hq;
+    int64_t hq = bhq % Hq;
+    int64_t hkv = hq / (Hq / Hkv);
+    int64_t bhkv = b * Hkv + hkv;
+
+    int64_t q_row = static_cast<int64_t>(blockIdx.x) * kAttnBq + warp_id;
+    bool q_valid = q_row < L;
+
+    float q_reg[kAttnElemPerLane] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float o_reg[kAttnElemPerLane] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float m = -INFINITY;
+    float l_sum = 0.0f;
+
+    const __nv_bfloat16* q_ptr = q + (bhq * L + q_row) * kAttnHeadDim;
+    if (q_valid) {
+#pragma unroll
+        for (int i = 0; i < kAttnElemPerLane; ++i) {
+            q_reg[i] = __bfloat162float(q_ptr[lane + i * 32]);
+        }
+    }
+
+    const __nv_bfloat16* k_head = k + bhkv * S * kAttnHeadDim;
+    const __nv_bfloat16* v_head = v + bhkv * S * kAttnHeadDim;
+    const float* mask_row =
+        (mask != nullptr && q_valid) ? (mask + (bhq * L + q_row) * S) : nullptr;
+
+    __shared__ __nv_bfloat16 k_tile[kAttnBk][kAttnHeadDim];
+    __shared__ __nv_bfloat16 v_tile[kAttnBk][kAttnHeadDim];
+
+    int64_t max_causal_k = S - L + q_row;
+
+    for (int64_t k_start = 0; k_start < S; k_start += kAttnBk) {
+#pragma unroll
+        for (int r = 0; r < kAttnBk; ++r) {
+            int64_t k_pos = k_start + r;
+            if (k_pos < S) {
+                k_tile[r][tid] = k_head[k_pos * kAttnHeadDim + tid];
+                v_tile[r][tid] = v_head[k_pos * kAttnHeadDim + tid];
+            }
+        }
+        __syncthreads();
+
+        if (q_valid) {
+            int tile_len = static_cast<int>(
+                (k_start + kAttnBk < S) ? kAttnBk : (S - k_start));
+            for (int j = 0; j < tile_len; ++j) {
+                int64_t k_pos = k_start + j;
+                if (causal && k_pos > max_causal_k) {
+                    break;
+                }
+                float mask_val = 0.0f;
+                if (mask_row != nullptr) {
+                    mask_val = mask_row[k_pos];
+                    if (!isfinite(mask_val)) {
+                        continue;
+                    }
+                }
+
+                float dot = 0.0f;
+#pragma unroll
+                for (int i = 0; i < kAttnElemPerLane; ++i) {
+                    dot += q_reg[i] * __bfloat162float(k_tile[j][lane + i * 32]);
+                }
+#pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    dot += __shfl_xor_sync(0xffffffffu, dot, offset);
+                }
+
+                float s = dot * scale + mask_val;
+                float new_m = fmaxf(m, s);
+                float alpha = (m == -INFINITY) ? 0.0f : expf(m - new_m);
+                float p = expf(s - new_m);
+                l_sum = alpha * l_sum + p;
+#pragma unroll
+                for (int i = 0; i < kAttnElemPerLane; ++i) {
+                    o_reg[i] = alpha * o_reg[i] +
+                               p * __bfloat162float(v_tile[j][lane + i * 32]);
+                }
+                m = new_m;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (q_valid) {
+        __nv_bfloat16* out_ptr = out + (bhq * L + q_row) * kAttnHeadDim;
+        float inv_l = (l_sum > 0.0f) ? (1.0f / l_sum) : 0.0f;
+#pragma unroll
+        for (int i = 0; i < kAttnElemPerLane; ++i) {
+            out_ptr[lane + i * 32] = __float2bfloat16(o_reg[i] * inv_l);
+        }
+    }
+}
+
 }  // namespace
 
 // Reference-only selected scheduling controls are not additional learner tasks.
@@ -497,6 +614,64 @@ Tensor swiglu_cuda(Tensor gate, Tensor up) {
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
-Tensor attention_cuda(Tensor, Tensor, Tensor, Tensor, double, bool) {
-    TORCH_CHECK(false, "Week 2 Day 5: implement tiled CUDA attention");
+Tensor attention_cuda(
+    Tensor q,
+    Tensor k,
+    Tensor v,
+    Tensor mask,
+    double scale,
+    bool causal) {
+    c10::cuda::CUDAGuard guard(q.device());
+    int64_t B = q.size(0);
+    int64_t Hq = q.size(1);
+    int64_t L = q.size(2);
+    int64_t Hkv = k.size(1);
+    int64_t S = k.size(2);
+
+    if (B == 0 || Hq == 0 || L == 0) {
+        return at::empty_like(q);
+    }
+    if (S == 0) {
+        return at::zeros_like(q);
+    }
+
+    Tensor out = at::empty_like(q);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    dim3 block(kAttnThreads);
+    dim3 grid(
+        static_cast<unsigned int>((L + kAttnBq - 1) / kAttnBq),
+        static_cast<unsigned int>(B * Hq));
+
+    const auto* q_ptr =
+        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>());
+    const auto* k_ptr =
+        reinterpret_cast<const __nv_bfloat16*>(k.data_ptr<at::BFloat16>());
+    const auto* v_ptr =
+        reinterpret_cast<const __nv_bfloat16*>(v.data_ptr<at::BFloat16>());
+    const float* mask_ptr =
+        (mask.numel() > 0) ? mask.data_ptr<float>() : nullptr;
+    auto* out_ptr =
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>());
+
+    tiled_prefill_attention_kernel<<<grid, block, 0, stream>>>(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        mask_ptr,
+        out_ptr,
+        Hq,
+        Hkv,
+        L,
+        S,
+        static_cast<float>(scale),
+        causal);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+Tensor paged_cache_update_cuda(Tensor, Tensor, int64_t, int64_t) {
+    TORCH_CHECK(false, "Week 3 Day 3: implement CUDA paged cache update");
+}
+Tensor paged_attention_cuda(
+    Tensor, Tensor, Tensor, Tensor, Tensor, int64_t, double, bool) {
+    TORCH_CHECK(false, "Week 3 Day 4: implement CUDA paged attention");
 }

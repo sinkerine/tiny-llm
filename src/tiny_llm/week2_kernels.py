@@ -86,5 +86,66 @@ def decode_attention_custom(
 
 
 def dense_prefill_attention_mma(query, key, value, scale, mask=None):
-    # Day 5: validate BF16/D128 inputs, then call cuda_ops.attention.
-    raise NotImplementedError("Week 2 Day 5: implement tiled CUDA attention wrapper")
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4 or key.shape != value.shape:
+        raise ValueError(
+            "dense_prefill_attention_mma expects 4D Q [B,Hq,L,128] and matching K/V [B,Hkv,S,128]"
+        )
+    batch, num_heads, query_len, head_dim = query.shape
+    key_batch, num_kv_heads, seq_len, key_head_dim = key.shape
+    if (
+        batch != key_batch
+        or head_dim != 128
+        or key_head_dim != 128
+        or num_kv_heads == 0
+        or num_heads % num_kv_heads != 0
+    ):
+        raise ValueError("incompatible GQA or head_dim!=128 shape for tiled attention")
+    if query_len < DENSE_PREFILL_MIN_QUERY:
+        raise ValueError(
+            f"tiled prefill attention requires L >= {DENSE_PREFILL_MIN_QUERY}, got {query_len}"
+        )
+    if (
+        query.dtype != torch.bfloat16
+        or key.dtype != torch.bfloat16
+        or value.dtype != torch.bfloat16
+    ):
+        raise ValueError("tiled attention requires BF16 Q, K, and V")
+    if not (query.is_cuda and key.is_cuda and value.is_cuda) or not (
+        query.device == key.device == value.device
+    ):
+        raise ValueError("tiled attention requires Q, K, and V on the same CUDA device")
+
+    causal = False
+    if mask is None:
+        mask_tensor = torch.empty(0, dtype=torch.float32, device=query.device)
+    elif isinstance(mask, str):
+        if mask != "causal":
+            raise ValueError(f"unsupported attention mask string: {mask!r}")
+        causal = True
+        mask_tensor = torch.empty(0, dtype=torch.float32, device=query.device)
+    elif isinstance(mask, torch.Tensor):
+        if not mask.is_floating_point():
+            raise ValueError("additive attention mask must be a floating-point tensor")
+        try:
+            mask_tensor = torch.broadcast_to(
+                mask, (batch, num_heads, query_len, seq_len)
+            )
+        except RuntimeError as exc:
+            raise ValueError(
+                f"attention mask shape {tuple(mask.shape)} is not broadcastable to "
+                f"{(batch, num_heads, query_len, seq_len)}"
+            ) from exc
+        mask_tensor = mask_tensor.to(
+            device=query.device, dtype=torch.float32
+        ).contiguous()
+    else:
+        raise ValueError(f"unsupported attention mask type: {type(mask).__name__}")
+
+    return cuda_ops.attention(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        mask_tensor,
+        float(scale),
+        causal,
+    )

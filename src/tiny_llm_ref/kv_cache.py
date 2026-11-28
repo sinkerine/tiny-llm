@@ -70,6 +70,190 @@ class TinyKvCache(ABC):
         raise NotImplementedError("This KV cache does not support rewind")
 
 
+class BatchingKvCache(TinyKvCache):
+    def __init__(self, max_active_requests: int, max_seq_len: int | None = None):
+        self.max_active_requests = max_active_requests
+        self.max_seq_len = max_seq_len
+        self.kv_caches: list[TinyKvCache | None] = [None] * max_active_requests
+        self.HD = None
+        self.last_batch_bytes = 0
+        self.staging_copy_bytes = 0
+
+    def update_and_fetch(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        mask_length: int | None = None,
+        mask: torch.Tensor | str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, int | None, Optional[torch.Tensor]]:
+        B, H, S, D = keys.shape
+        assert keys.shape == values.shape
+        if self.max_seq_len is not None:
+            assert S <= self.max_seq_len
+        if self.HD is None:
+            self.HD = (H, D)
+        else:
+            assert self.HD == (H, D), f"expect {self.HD} but got {H, D}"
+        assert B == self.max_active_requests
+        data = []
+        ref_dtype = keys.dtype
+        ref_device = keys.device
+        for b in range(B):
+            if self.kv_caches[b] is None:
+                data.append(None)
+                continue
+            key, value = keys[b : b + 1], values[b : b + 1]
+            new_key, new_value, seq_len, row_mask = self.kv_caches[b].update_and_fetch(
+                key, value
+            )
+            ref_dtype = new_key.dtype
+            ref_device = new_key.device
+            data.append((new_key[0], new_value[0], seq_len, row_mask))
+
+        def get_seq_len(item):
+            if item is None:
+                return 0
+            _, _, seq_len, _ = item
+            return seq_len
+
+        seq_len = max(map(get_seq_len, data))
+        out_keys = torch.zeros(
+            (self.max_active_requests, H, seq_len, D),
+            dtype=ref_dtype,
+            device=ref_device,
+        )
+        out_values = torch.zeros(
+            (self.max_active_requests, H, seq_len, D),
+            dtype=ref_dtype,
+            device=ref_device,
+        )
+        masks = torch.full(
+            (self.max_active_requests, mask_length, seq_len),
+            -torch.inf,
+            dtype=ref_dtype,
+            device=ref_device,
+        )
+        for b in range(B):
+            if data[b] is None:
+                continue
+            key, value, row_s, row_mask = data[b]
+            self.staging_copy_bytes += key.nbytes + value.nbytes
+            out_keys[b, :, seq_len - row_s : seq_len, :] = key
+            out_values[b, :, seq_len - row_s : seq_len, :] = value
+            if row_mask is None or row_mask == "causal":
+                masks[b, :, seq_len - row_s : seq_len] = causal_mask(
+                    mask_length, row_s, dtype=key.dtype
+                ).to(ref_device)
+            elif isinstance(row_mask, torch.Tensor):
+                masks[b, :, seq_len - row_s : seq_len] = row_mask.to(
+                    device=ref_device, dtype=ref_dtype
+                )
+            else:
+                raise NotImplementedError
+        self.last_batch_bytes = out_keys.nbytes + out_values.nbytes
+        return out_keys, out_values, None, masks.reshape(B, 1, mask_length, seq_len)
+
+    def update_and_fetch_paged(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        mask_length: int | None = None,
+        mask: torch.Tensor | str | None = None,
+    ) -> "PagedKvMetadata":
+        from .paged_kv_cache import PagedKvMetadata, TinyKvPagedCache
+
+        if keys.ndim != 4 or values.ndim != 4:
+            raise ValueError("Batched K/V chunks must be 4D [B, H, S, D]")
+        if keys.shape != values.shape:
+            raise ValueError("Batched K/V chunks must have the same shape")
+        B, H, S, D = keys.shape
+        if B != self.max_active_requests:
+            raise ValueError(f"Expected batch size {self.max_active_requests}, got {B}")
+        if self.HD is not None and self.HD != (H, D):
+            raise ValueError(f"expect {self.HD} but got {H, D}")
+
+        pool = None
+        active_caches = []
+        for b in range(B):
+            cache = self.kv_caches[b]
+            if cache is None:
+                continue
+            if not isinstance(cache, TinyKvPagedCache):
+                raise ValueError("BatchingKvCache contains a non-paged request cache")
+            if pool is None:
+                pool = cache.pool
+            elif pool is not cache.pool:
+                raise ValueError("Paged batch caches must share one page pool")
+            if self.max_seq_len is not None and cache.offset + S > self.max_seq_len:
+                raise ValueError("Paged batch append exceeds max_seq_len")
+            cache.validate_append(keys[b : b + 1], values[b : b + 1])
+            active_caches.append((b, cache))
+
+        if pool is None:
+            raise ValueError("Cannot build paged metadata without active requests")
+
+        pool_state = pool._snapshot_state()
+        cache_states = [(cache, cache._snapshot_state()) for _, cache in active_caches]
+        old_hd = self.HD
+        context_lens = [0] * B
+        max_pages = 0
+        try:
+            for b, cache in active_caches:
+                cache.update_and_fetch_paged(
+                    keys[b : b + 1],
+                    values[b : b + 1],
+                    mask_length=mask_length,
+                    mask=mask,
+                )
+                context_lens[b] = cache.offset
+                max_pages = max(max_pages, cache.num_pages)
+            self.HD = (H, D)
+        except Exception:
+            pool._restore_state(pool_state)
+            for cache, state in cache_states:
+                cache._restore_state(state)
+            self.HD = old_hd
+            raise
+
+        self.last_batch_bytes = 0
+
+        rows = []
+        for cache in self.kv_caches:
+            if cache is None:
+                rows.append([-1] * max_pages)
+            else:
+                rows.append(cache.page_ids + [-1] * (max_pages - cache.num_pages))
+
+        device = pool.key_pages.device
+        return PagedKvMetadata(
+            key_pages=pool.key_pages,
+            value_pages=pool.value_pages,
+            block_table=torch.tensor(rows, dtype=torch.int32, device=device),
+            context_lens=torch.tensor(context_lens, dtype=torch.int32, device=device),
+            page_size=pool.page_size,
+            mask=mask,
+        )
+
+    def add_request(self, prefilled: TinyKvCache, id: int):
+        if id >= self.max_active_requests:
+            raise ValueError(f"Request id {id} is out of range")
+        if isinstance(prefilled, TinyKvFullCache) and prefilled.key_values is not None:
+            keys, _ = prefilled.key_values
+            B, H, _, D = keys.shape
+            assert B == 1
+            if self.HD is None:
+                self.HD = (H, D)
+            else:
+                assert self.HD == (H, D)
+        self.kv_caches[id] = prefilled
+
+    def remove_request(self, id: int):
+        if self.kv_caches[id] is None:
+            raise ValueError(f"Request id {id} is not in the cache")
+        self.kv_caches[id].release()
+        self.kv_caches[id] = None
+
+
 class TinyKvFullCache(TinyKvCache):
     def __init__(self, capacity: int | None = None):
         if capacity is not None and (

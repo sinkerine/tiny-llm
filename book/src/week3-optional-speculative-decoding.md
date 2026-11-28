@@ -99,9 +99,9 @@ Pass the last accepted token followed by the draft proposal to the target model
 in one call. Request logits for every supplied position, then compare the target
 greedy tokens with the aligned draft sequence.
 
-Keep prompt, proposal, and verification token arrays in a supported 32-bit
-integer dtype. Mixing unsigned and signed 32-bit token arrays can promote a
-concatenation to 64-bit indices, which quantized embeddings reject.
+Keep prompt, proposal, and verification token tensors in `torch.int32`, which
+matches the test contract (`tokens.dtype == torch.int32`) and avoids implicit
+dtype promotion across concatenations.
 
 The first supplied token is already accepted. Starting at the next position,
 find the longest matching prefix. If every draft token matches, keep the target
@@ -136,7 +136,7 @@ Run the integrated path with a small draft model and a larger target model:
 
 ```bash
 pdm run main --solution tiny_llm --loader week3 \
-  --draft-model qwen3-0.6b --model qwen3-4b --max-tokens 64
+  --draft-model Qwen/Qwen3-0.6B --model Qwen/Qwen3-4B --max-tokens 64
 ```
 
 This runs your completed Week 3 solution. To compare the completed reference

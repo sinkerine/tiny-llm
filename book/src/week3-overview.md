@@ -11,12 +11,14 @@ implementation may serve every query shape; the completed reference adds a
 tiled schedule for the supported BF16 long-prefill hot case.
 
 The [Week 2 `selected` model](./week2-05-tiled-prefill-attention.md) completes
-the single-request route with tiled dense attention; its course-owned quantized
-projections remain an inspectable kernel lesson. Week 3 deliberately switches
-dense-model projections to `mx.quantized_matmul` at model construction, while retaining the
-course-owned normalization, activation, cache, attention, paging, and
-scheduler paths. This keeps Week 3 focused on serving-system mechanisms rather
-than carrying the teaching kernel's projection cost through every benchmark.
+the single-request route with tiled dense attention and course-owned packed W4
+CUDA projections. On this PyTorch/CUDA branch, Week 3 reuses that same runtime
+and native extension (`src/cuda/bindings.cpp`, `src/cuda/student.cu`), while
+exposing an optional per-weight `use_torch_quantized_linear` selector
+(`torch_quantized_linear`, which dequantizes W4 weights and calls
+`torch.nn.functional.linear`) as a readable PyTorch projection control.
+Normalization, activation, RoPE, cache state, attention, paging, and scheduling
+all remain course-owned.
 
 
 ## What We’ll Cover

@@ -192,25 +192,18 @@ expose to attention as `key_pages` and `value_pages` should contain only the
 ## Writing Only the New Slice
 
 When a token is appended, the pool should write `H × 1 × D` numbers into one
-page. The obvious way to do that in MLX is a slice assignment:
+page. In PyTorch, you can start with an in-place slice assignment:
 
 ```python
 pages[page_id, :, start:end, :] = new_values
 ```
 
-MLX arrays behave as values, though, and evaluation is lazy. That assignment
-may be carried out by producing a whole new page tensor, which for a big pool
-means copying every page to change a few numbers.
-
-You will fix this with a small custom primitive, `paged_cache_update`. Its
-output shares the input's memory instead of copying it, and its Metal kernel
-launches one thread per element of the new slice: `H × new_tokens × D`
-threads, no matter how big the pool is. Normally MLX assumes an array's
-contents never change after it is computed. This primitive breaks that
-assumption on purpose. It is safe here because the pool is the only owner of
-its page tensors, and it replaces its reference with the returned array right
-away, so later reads depend on the updated array. The only full copies left
-are the doubling steps from the previous section.
+In Task 2, you will replace that with a small custom CUDA operator,
+`paged_cache_update`. Its kernel writes in place into `pages` and launches one
+thread per element of the new slice — `H × new_tokens × D` threads on PyTorch's
+current CUDA stream — no matter how big the pool is. It never touches any other
+page in the pool, and the only full copies left are the doubling steps from the
+previous section.
 
 ## Appending a Chunk
 
@@ -353,12 +346,12 @@ does not declare, so add them as well:
 | `TinyKvPagedPool` | `page_size`, `num_pages`, `num_free_pages`, `capacity`, `storage_nbytes`, `allocate_page()`, `read_page(page_id)`, `write_page_slice(page_id, start, key, value)`, `free_page(page_id)`, `reset()` |
 | `TinyKvPagedCache` | `pool`, `page_ids`, `page_lens`, `offset`, `num_pages`, `key_values` (the gathered dense pair, or `None` when empty), `gather_dense()`, `update_and_fetch(...)`, `update_and_fetch_paged(...)`, `block_table(...)`, `context_lens()`, `paged_metadata(...)`, `materialize()`, `rewind(n)`, `release()` |
 
-`materialize()` evaluates the pool's page tensors. Day 2's scheduler already
-calls it after each prefill chunk, which keeps MLX's lazy graph from growing
-without bound.
+`materialize()` synchronizes the pool's CUDA device
+(`torch.cuda.synchronize(key_pages.device)`) when page tensors are on CUDA.
+Day 2's scheduler already calls it after each prefill chunk.
 
-For this task, `write_page_slice` may use plain MLX slice assignment. It is
-correct, just not cheap. Task 2 replaces it.
+For this task, `write_page_slice` may use plain PyTorch slice assignment. Task
+2 replaces the CUDA path with a custom kernel.
 
 The benchmark also prints a few optional pool counters if your pool defines
 them: `reused_page_allocations`, `storage_growths`,
@@ -379,32 +372,34 @@ metadata for two requests that share a pool.
 ## Task 2: Write Only the New Slice
 
 ```
-src/extensions/src/paged_attention.cpp
-src/extensions/src/paged_attention.metal
+src/cuda/student.cu
+src/cuda/bindings.cpp         (already wired)
+src/tiny_llm/cuda_ops.py      (already wired)
 src/tiny_llm/paged_kv_cache.py
 ```
 
-The C++ and Metal files, the header declaration, the Python binding, and the
-CMake entries for `paged_cache_update` already exist. Replace the stubs:
+The pybind11 binding in `src/cuda/bindings.cpp` and the Python validation
+wrapper `cuda_ops.paged_cache_update(pages, chunk, page_id, start)` in
+`src/tiny_llm/cuda_ops.py` already exist. `cuda_ops.paged_cache_update` checks
+that `pages` is `[P, H, page_size, D]` and `chunk` is `[1, H, length, D]` on
+CUDA with matching `H`, `D`, and dtype (`float32` or `bfloat16`), and that
+`0 <= page_id < P` and `0 <= start` with `start + length <= page_size`,
+raising `ValueError` on anything else.
 
-- `tiny_llm_ext::paged_cache_update(pages, values, page_id, start)` in
-  `paged_attention.cpp` checks its inputs and returns a lazy array with the same shape and dtype as `pages`.
-  Require `pages` to be `[P, H, page_size, D]` and `values` to be
-  `[1, H, length, D]`, with matching `H`, `D`, and dtype (float32 or
-  bfloat16). Require `0 <= page_id < P` and
-  `0 <= start` with `start + length <= page_size`. Throw on anything else.
-- `PagedCacheUpdate::eval_cpu` in `paged_attention.cpp` throws. The operator
-  is GPU-only.
-- `PagedCacheUpdate::eval_gpu` in `paged_attention.cpp` checks that both
-  inputs are row-contiguous, makes the output share the `pages` buffer, and
-  launches `paged_cache_update_kernel` over the `H × length × D` new
-  elements.
-- `paged_cache_update_kernel` in `paged_attention.metal` copies each element
-  of `values` to its slot in page `page_id`, starting at `start`.
+Replace the fail-closed stub in `src/cuda/student.cu`:
 
-Do not add a second primitive or binding. Rebuild, then switch
-`TinyKvPagedPool.write_page_slice` to call the extension for keys and for
-values, passing contiguous chunks:
+- Implement `paged_cache_update_cuda(Tensor pages, Tensor chunk, int64_t page_id, int64_t start)`:
+  guard the input device with `c10::cuda::CUDAGuard`, dispatch a CUDA kernel
+  (`paged_cache_update_kernel`) for both `bfloat16` and `float32` on
+  `at::cuda::getCurrentCUDAStream()` over the `H × length × D` new elements,
+  check launch errors with `C10_CUDA_KERNEL_LAUNCH_CHECK()`, and return
+  `pages`.
+- Each thread copies one element of `chunk` to its slot in `pages` at
+  `page_id` starting at `start`.
+
+Do not add a second binding. Rebuild, then switch
+`TinyKvPagedPool.write_page_slice` to call `cuda_ops.paged_cache_update` for
+CUDA key and value tensors, passing `.contiguous()` chunks:
 
 ```bash
 pdm run build-ext
@@ -437,8 +432,8 @@ from Day 1:
   residual connections, and the attention and MLP calls. Forward
   `use_paged_attention` to the attention layer.
 - `Qwen3ModelWeek3.__init__`: load every projection, the embedding, and any
-  separate `lm_head` with `QuantizedWeights.from_mlx_layer(...)`, passing the
-  constructor's `use_mlx_quantized_linear` through. Build one block per layer
+  separate `lm_head` with `QuantizedWeights.from_layer(...)`, passing the
+  constructor's `use_torch_quantized_linear` through. Build one block per layer
   with `use_paged_attention=enable_paged_attention`.
 - `Qwen3ModelWeek3.__call__`: the embedding lookup, the layers with a causal
   mask, `logits_to_keep`, the final norm, and the tied or separate output
@@ -447,11 +442,11 @@ from Day 1:
 A dense model uses `Qwen3MLP` in every layer. `is_qwen3_moe_sparse_layer` and
 `Moe` belong to the optional Day 6 chapter.
 
-Keep Day 1's projection setup: `use_mlx_quantized_linear=True` is the dense
-Week 3 default, so dense-model projections run through `mx.quantized_matmul`,
-while embedding, normalization, activation, RoPE, cache, and attention stay
-your own code. The optional MoE chapter keeps its own router and expert
-projection rules; this default does not extend to them.
+Keep Day 1's projection setup: `use_torch_quantized_linear=False` is the
+default on PyTorch/CUDA so projections reuse your Week 2 packed W4 CUDA
+kernels, while setting `use_torch_quantized_linear=True` routes projections
+through the readable PyTorch control (`torch_quantized_linear`). Embedding,
+normalization, activation, RoPE, cache, and attention stay your own code.
 
 **Then add the paging changes:**
 
@@ -474,17 +469,15 @@ prompt, with tied and untied output heads, and token by token during decode.
 They also build two requests from one model, batch them, and check the
 returned `block_table` and `context_lens`.
 
-Then run the whole day's tests and the full model:
+Then run the whole day's tests:
 
 ```bash
 pdm run test --week 3 --day 3
-
-pdm run main --solution tiny_llm --loader week3 \
-  --disable-paged-attention --model qwen3-0.6b
-
-pdm run bench --solution tiny_llm --loader week3 \
-  --disable-paged-attention --batch-decode --model qwen3-0.6b
 ```
+
+(The older `pdm run bench --batch-decode` runner remains a historical MLX/Metal
+script; on this PyTorch/CUDA branch, Day 3's dense-gather path is exercised via
+`enable_paged_attention=False` in Python and in `test_week_3_day_3.py`.)
 
 ## What to Look For in the Benchmark
 
@@ -518,9 +511,9 @@ there. Day 4 removes it.
 Paging does not make a single request faster. A page table adds a lookup,
 and this checkpoint still copies K/V for attention. What it gives a server is
 memory that is handed out as requests grow, returned when they finish, and
-reused by the next request. Apple silicon's unified memory removes the copy
-between CPU and GPU memory, but not allocation, fragmentation, or copying
-inside GPU-visible memory, so these savings still apply.
+reused by the next request. On a discrete CUDA GPU, device VRAM is finite and
+shared across active requests, so avoiding allocation churn, fragmentation, and
+full-history copies directly saves memory and bandwidth.
 
 One run with a fixed batch shows how much K/V memory you saved. It does not
 show that the server can accept more requests at once. To claim that, you

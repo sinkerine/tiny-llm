@@ -385,3 +385,290 @@ Tensor qk_norm_rope_cuda(Tensor x, Tensor w, Tensor offsets, double eps, double 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
+
+template <typename T>
+__global__ void paged_cache_update_kernel(
+    T *__restrict__ pages,
+    const T *__restrict__ chunk,
+    int64_t H,
+    int64_t page_size,
+    int64_t S,
+    int64_t D,
+    int64_t page_id,
+    int64_t start) {
+    int64_t n = H * S * D;
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    int64_t d = idx % D;
+    int64_t tmp = idx / D;
+    int64_t s = tmp % S;
+    int64_t h = tmp / S;
+    pages[((page_id * H + h) * page_size + (start + s)) * D + d] = chunk[idx];
+}
+
+Tensor paged_cache_update_cuda(Tensor pages, Tensor chunk, int64_t page_id, int64_t start) {
+    c10::cuda::CUDAGuard guard(pages.device());
+    int64_t H = pages.size(1);
+    int64_t page_size = pages.size(2);
+    int64_t D = pages.size(3);
+    int64_t S = chunk.size(2);
+    int64_t n = H * S * D;
+    if (n == 0) return pages;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    unsigned int grid = static_cast<unsigned int>((n + 255) / 256);
+    if (pages.scalar_type() == at::kBFloat16) {
+        paged_cache_update_kernel<bf16><<<grid, 256, 0, stream>>>(
+            reinterpret_cast<bf16 *>(pages.data_ptr()),
+            reinterpret_cast<const bf16 *>(chunk.data_ptr()),
+            H, page_size, S, D, page_id, start);
+    } else if (pages.scalar_type() == at::kFloat) {
+        paged_cache_update_kernel<float><<<grid, 256, 0, stream>>>(
+            pages.data_ptr<float>(),
+            chunk.data_ptr<float>(),
+            H, page_size, S, D, page_id, start);
+    } else {
+        TORCH_CHECK(false, "paged_cache_update supports float32 or bfloat16");
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return pages;
+}
+
+__device__ __forceinline__ float load_as_float(const float *p, int64_t i) { return p[i]; }
+__device__ __forceinline__ float load_as_float(const bf16 *p, int64_t i) { return __bfloat162float(p[i]); }
+__device__ __forceinline__ void store_from_float(float *p, int64_t i, float v) { p[i] = v; }
+__device__ __forceinline__ void store_from_float(bf16 *p, int64_t i, float v) { p[i] = __float2bfloat16(v); }
+
+template <typename T>
+__global__ void paged_attention_direct_kernel(
+    const T *__restrict__ q,
+    const T *__restrict__ key_pages,
+    const T *__restrict__ value_pages,
+    const int32_t *__restrict__ block_table,
+    const int32_t *__restrict__ context_lens,
+    T *__restrict__ out,
+    int64_t Hq,
+    int64_t Hkv,
+    int64_t L,
+    int64_t D,
+    int64_t page_size,
+    int64_t max_pages,
+    float scale,
+    bool causal) {
+    extern __shared__ float o_smem[];
+    int lane = threadIdx.x;
+    int64_t q_row = static_cast<int64_t>(blockIdx.x);
+    int64_t bhq = static_cast<int64_t>(blockIdx.y);
+    int64_t b = bhq / Hq;
+    int64_t hq = bhq % Hq;
+    int64_t hkv = hq / (Hq / Hkv);
+    int64_t context_len = static_cast<int64_t>(context_lens[b]);
+
+    const T *q_ptr = q + (bhq * L + q_row) * D;
+    T *out_ptr = out + (bhq * L + q_row) * D;
+    for (int64_t d = lane; d < D; d += 32) {
+        o_smem[d] = 0.0f;
+    }
+
+    float m = -INFINITY;
+    float l_sum = 0.0f;
+    int64_t limit = context_len;
+    if (causal) {
+        int64_t causal_end = context_len - L + q_row + 1;
+        if (causal_end < limit) limit = causal_end;
+    }
+
+    const int32_t *bt_row = block_table + b * max_pages;
+    for (int64_t k_pos = 0; k_pos < limit; ++k_pos) {
+        int64_t page_id = static_cast<int64_t>(bt_row[k_pos / page_size]);
+        int64_t slot = k_pos % page_size;
+        int64_t kv_base = ((page_id * Hkv + hkv) * page_size + slot) * D;
+
+        float dot = 0.0f;
+        for (int64_t d = lane; d < D; d += 32) {
+            dot += load_as_float(q_ptr, d) * load_as_float(key_pages, kv_base + d);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            dot += __shfl_xor_sync(0xffffffffu, dot, offset);
+        }
+
+        float s = dot * scale;
+        float new_m = fmaxf(m, s);
+        float alpha = (m == -INFINITY) ? 0.0f : expf(m - new_m);
+        float p = expf(s - new_m);
+        l_sum = alpha * l_sum + p;
+        for (int64_t d = lane; d < D; d += 32) {
+            o_smem[d] = alpha * o_smem[d] + p * load_as_float(value_pages, kv_base + d);
+        }
+        m = new_m;
+    }
+
+    float inv_l = (l_sum > 0.0f) ? (1.0f / l_sum) : 0.0f;
+    for (int64_t d = lane; d < D; d += 32) {
+        store_from_float(out_ptr, d, o_smem[d] * inv_l);
+    }
+}
+
+__global__ void paged_attention_tiled_bf16_d128_kernel(
+    const bf16 *__restrict__ q,
+    const bf16 *__restrict__ key_pages,
+    const bf16 *__restrict__ value_pages,
+    const int32_t *__restrict__ block_table,
+    const int32_t *__restrict__ context_lens,
+    bf16 *__restrict__ out,
+    int64_t Hq,
+    int64_t Hkv,
+    int64_t L,
+    int64_t page_size,
+    int64_t max_pages,
+    float scale,
+    bool causal) {
+    int tid = threadIdx.x;
+    int warp_id = tid >> 5;
+    int lane = tid & 31;
+
+    int64_t bhq = static_cast<int64_t>(blockIdx.y);
+    int64_t b = bhq / Hq;
+    int64_t hq = bhq % Hq;
+    int64_t hkv = hq / (Hq / Hkv);
+    int64_t context_len = static_cast<int64_t>(context_lens[b]);
+
+    int64_t q_row = static_cast<int64_t>(blockIdx.x) * 4 + warp_id;
+    bool q_valid = q_row < L;
+
+    float q_reg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float o_reg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float m = -INFINITY;
+    float l_sum = 0.0f;
+
+    const bf16 *q_ptr = q + (bhq * L + q_row) * 128;
+    if (q_valid) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            q_reg[i] = __bfloat162float(q_ptr[lane + i * 32]);
+        }
+    }
+
+    const int32_t *bt_row = block_table + b * max_pages;
+    __shared__ bf16 k_tile[16][128];
+    __shared__ bf16 v_tile[16][128];
+    int64_t max_causal_k = context_len - L + q_row;
+
+    for (int64_t k_start = 0; k_start < context_len; k_start += 16) {
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            int64_t k_pos = k_start + r;
+            if (k_pos < context_len) {
+                int64_t page_id = static_cast<int64_t>(bt_row[k_pos / page_size]);
+                int64_t slot = k_pos % page_size;
+                int64_t kv_base = ((page_id * Hkv + hkv) * page_size + slot) * 128;
+                k_tile[r][tid] = key_pages[kv_base + tid];
+                v_tile[r][tid] = value_pages[kv_base + tid];
+            }
+        }
+        __syncthreads();
+
+        if (q_valid) {
+            int tile_len = static_cast<int>(
+                (k_start + 16 < context_len) ? 16 : (context_len - k_start));
+            for (int j = 0; j < tile_len; ++j) {
+                int64_t k_pos = k_start + j;
+                if (causal && k_pos > max_causal_k) {
+                    break;
+                }
+                float dot = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    dot += q_reg[i] * __bfloat162float(k_tile[j][lane + i * 32]);
+                }
+#pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    dot += __shfl_xor_sync(0xffffffffu, dot, offset);
+                }
+                float s = dot * scale;
+                float new_m = fmaxf(m, s);
+                float alpha = (m == -INFINITY) ? 0.0f : expf(m - new_m);
+                float p = expf(s - new_m);
+                l_sum = alpha * l_sum + p;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    o_reg[i] = alpha * o_reg[i] +
+                               p * __bfloat162float(v_tile[j][lane + i * 32]);
+                }
+                m = new_m;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (q_valid) {
+        bf16 *out_ptr = out + (bhq * L + q_row) * 128;
+        float inv_l = (l_sum > 0.0f) ? (1.0f / l_sum) : 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            out_ptr[lane + i * 32] = __float2bfloat16(o_reg[i] * inv_l);
+        }
+    }
+}
+
+Tensor paged_attention_cuda(
+    Tensor q,
+    Tensor key_pages,
+    Tensor value_pages,
+    Tensor block_table,
+    Tensor context_lens,
+    int64_t page_size,
+    double scale,
+    bool causal) {
+    c10::cuda::CUDAGuard guard(q.device());
+    int64_t B = q.size(0);
+    int64_t Hq = q.size(1);
+    int64_t L = q.size(2);
+    int64_t D = q.size(3);
+    int64_t Hkv = key_pages.size(1);
+    int64_t max_pages = block_table.size(1);
+    Tensor out = at::empty_like(q);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    if (q.scalar_type() == at::kBFloat16 && D == 128 && L >= 9) {
+        dim3 block(128);
+        dim3 grid(
+            static_cast<unsigned int>((L + 3) / 4),
+            static_cast<unsigned int>(B * Hq));
+        paged_attention_tiled_bf16_d128_kernel<<<grid, block, 0, stream>>>(
+            reinterpret_cast<const bf16 *>(q.data_ptr()),
+            reinterpret_cast<const bf16 *>(key_pages.data_ptr()),
+            reinterpret_cast<const bf16 *>(value_pages.data_ptr()),
+            block_table.data_ptr<int32_t>(),
+            context_lens.data_ptr<int32_t>(),
+            reinterpret_cast<bf16 *>(out.data_ptr()),
+            Hq, Hkv, L, page_size, max_pages, static_cast<float>(scale), causal);
+    } else if (q.scalar_type() == at::kBFloat16) {
+        dim3 block(32);
+        dim3 grid(static_cast<unsigned int>(L), static_cast<unsigned int>(B * Hq));
+        size_t smem = static_cast<size_t>(D) * sizeof(float);
+        paged_attention_direct_kernel<bf16><<<grid, block, smem, stream>>>(
+            reinterpret_cast<const bf16 *>(q.data_ptr()),
+            reinterpret_cast<const bf16 *>(key_pages.data_ptr()),
+            reinterpret_cast<const bf16 *>(value_pages.data_ptr()),
+            block_table.data_ptr<int32_t>(),
+            context_lens.data_ptr<int32_t>(),
+            reinterpret_cast<bf16 *>(out.data_ptr()),
+            Hq, Hkv, L, D, page_size, max_pages, static_cast<float>(scale), causal);
+    } else if (q.scalar_type() == at::kFloat) {
+        dim3 block(32);
+        dim3 grid(static_cast<unsigned int>(L), static_cast<unsigned int>(B * Hq));
+        size_t smem = static_cast<size_t>(D) * sizeof(float);
+        paged_attention_direct_kernel<float><<<grid, block, smem, stream>>>(
+            q.data_ptr<float>(),
+            key_pages.data_ptr<float>(),
+            value_pages.data_ptr<float>(),
+            block_table.data_ptr<int32_t>(),
+            context_lens.data_ptr<int32_t>(),
+            out.data_ptr<float>(),
+            Hq, Hkv, L, D, page_size, max_pages, static_cast<float>(scale), causal);
+    } else {
+        TORCH_CHECK(false, "paged_attention supports float32 or bfloat16");
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}

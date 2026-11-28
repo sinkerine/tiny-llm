@@ -107,11 +107,12 @@ feed-forward output is just the weighted top-k expert mixture.
 
 ## Grouped Expert Linear
 
-MLX does not give us a single high-level MoE block in `mlx.nn`. It does have a
-lower-level primitive, `mx.gather_qmm`, that performs quantized matrix
-multiplication while selecting a different matrix for each row. Use that
-primitive, an equivalent low-level library operation, or your own grouped kernel
-to implement the public `grouped_expert_linear` relation.
+In PyTorch/CUDA, `w_experts` is a 3D packed `QuantizedWeights` bank with shape
+`[E, O, D / 8]` (and per-group scales/biases `[E, O, D / group_size]`).
+Implement the public `grouped_expert_linear` relation by grouping token rows
+that share an expert id, slicing that expert's 2D `QuantizedWeights`, and
+calling `quantized_linear` on each active expert's contiguous batch of rows
+(or by writing your own grouped CUDA kernel as a stretch goal).
 
 For MoE, that means:
 
@@ -135,7 +136,7 @@ The router is just a quantized linear layer:
 
 ```python
 router_logits = quantized_linear(x, w_router)
-router_probs = softmax(router_logits, axis=-1)
+router_probs = torch.softmax(router_logits.float(), dim=-1).to(router_logits.dtype)
 ```
 
 For a batch of tokens:
@@ -151,12 +152,11 @@ where `E = num_experts`.
 Qwen3-MoE then uses top-k selection:
 
 ```python
-expert_ids = argpartition(-router_probs, k)[:k]
-expert_scores = take_along_axis(router_probs, expert_ids)
+expert_scores, expert_ids = torch.topk(router_probs, k=top_k, dim=-1)
 ```
 
-If `norm_topk_prob` is true, renormalize `expert_scores` so the selected scores
-sum to 1 for each token.
+If `norm_topk_prob` is true, renormalize `expert_scores` in FP32 so the
+selected scores sum to 1 for each token, then cast back to `router_probs.dtype`.
 
 ## Expert Step
 
@@ -211,16 +211,16 @@ One direct implementation is:
 
 ```plain
 1. flatten the leading token/expert dimensions,
-2. sort rows by expert id and retain the inverse order,
-3. call mx.gather_qmm with the matching expert ids,
-4. restore the original order and shape.
+2. sort rows by expert id with torch.argsort(..., stable=True) and group
+   consecutive runs with torch.unique_consecutive(..., return_counts=True),
+3. slice each active expert's 2D QuantizedWeights and call quantized_linear,
+4. scatter each expert's output back to the original row indices and shape.
 ```
 
-This task maps to the same idea as `QuantizedSwitchLinear` in `mlx-lm`: each
-token row uses a different packed expert matrix, and the expert ids choose the
-right matrix. If you want a deeper systems exercise, you may instead add a
-repository-native grouped C++/Metal operation, binding, and build registration.
-That native kernel is an optional stretch goal, not part of the Day 6 checkpoint.
+If you want a deeper systems exercise, you may instead add a
+repository-native grouped C++/CUDA operation, binding, and build registration.
+That native kernel is an optional stretch goal, not part of the Day 6
+checkpoint.
 
 ## Task 2: Router Top-k
 
@@ -237,8 +237,9 @@ returns:
 - selected expert ids
 - selected expert scores
 
-Use `quantized_linear` and `softmax`. Use `mx.argpartition` to select the top
-`num_experts_per_tok` experts, then `mx.take_along_axis` to gather their scores.
+Use `quantized_linear` and `torch.softmax` (accumulating softmax in FP32 and
+casting back to `router_logits.dtype`). Use `torch.topk(router_probs, k=top_k, dim=-1)`
+to select the top `num_experts_per_tok` experts and their scores.
 
 Keep `norm_topk_prob` as an argument because Qwen3-MoE stores this behavior in
 the model config.
@@ -286,8 +287,9 @@ The model wrapper should:
 - use regular `Qwen3MLP` for `mlp_only_layers`,
 - use `Moe` for sparse layers selected by
   `decoder_sparse_step`,
-- load router and expert weights as `QuantizedWeights` from the Qwen3-MoE MLX
-  model,
+- load router and expert weights as `QuantizedWeights` from the Hugging Face
+  Qwen3-MoE model (packing either a `switch_mlp` bank or stacked per-expert
+  `mlp.experts` weights into 3D `QuantizedWeights`),
 - preserve the same decode call shape:
 
 ```python
@@ -299,21 +301,19 @@ No scheduler API change in `src/tiny_llm/batch.py` is required for correctness.
 The focused command from the chapter opening validates this task without a model
 download. Its final case constructs a two-layer quantized fixture containing one
 dense `mlp_only_layers` layer and one sparse layer, dispatches it through the
-public model alias, runs it with a real KV cache, and compares normalized logits
-with MLX.
+public model alias, runs it with a real KV cache, and compares outputs with the
+dense PyTorch reference.
 
 After that passes, you may smoke-test the same public path through the normal
-generation entrypoints. This optional check downloads a large model and is not
-required for checkpoint feedback:
+generation entrypoint if your GPU has enough VRAM for a full MoE checkpoint.
+This optional check downloads a large model and is not required for checkpoint
+feedback:
 
 ```bash
-hf download Qwen/Qwen3-30B-A3B-MLX-4bit
+hf download Qwen/Qwen3-30B-A3B --cache-dir ~/.cache/tiny-llm
 
-pdm run main --solution tiny_llm --loader week3 --model qwen3-30b-a3b \
+pdm run main --solution tiny_llm --loader week3 --model Qwen/Qwen3-30B-A3B \
   --prompt "Give me a short introduction to mixture of experts."
-
-pdm run batch-main --solution tiny_llm --loader week3 --model qwen3-30b-a3b \
-  --batch-size 2 --prefill-step 16
 ```
 
 {{#include copyright.md}}

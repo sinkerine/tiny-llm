@@ -1,23 +1,23 @@
-import mlx.core as mx
+import torch
 
 from .quantize import QuantizedWeights
 
 
 def grouped_expert_linear(
-    x: mx.array,
+    x: torch.Tensor,
     w_experts: QuantizedWeights,
-    expert_ids: mx.array,
-) -> mx.array:
-    pass
+    expert_ids: torch.Tensor,
+) -> torch.Tensor:
+    raise NotImplementedError("Week 3 Day 6 (Optional): implement grouped_expert_linear")
 
 
 def route_topk(
-    x: mx.array,
+    x: torch.Tensor,
     w_router: QuantizedWeights,
     top_k: int,
     norm_topk_prob: bool = False,
-) -> tuple[mx.array, mx.array, mx.array]:
-    pass
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    raise NotImplementedError("Week 3 Day 6 (Optional): implement route_topk")
 
 
 class Moe:
@@ -30,7 +30,7 @@ class Moe:
         num_experts_per_tok: int,
         norm_topk_prob: bool = False,
     ):
-        pass
+        raise NotImplementedError("Week 3 Day 6 (Optional): implement Moe")
 
-    def __call__(self, x: mx.array) -> mx.array:
-        pass
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError("Week 3 Day 6 (Optional): implement Moe")

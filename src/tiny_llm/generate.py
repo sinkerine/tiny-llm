@@ -51,3 +51,15 @@ def simple_generate(
         streamer.put(next_token.cpu())
         y = torch.cat([y, next_token], 0)
     streamer.end()
+
+
+def speculative_generate(
+    draft_model,
+    model,
+    draft_tokenizer,
+    tokenizer,
+    prompt: str,
+    proposal_length: int = 4,
+    max_tokens: int = 256,
+) -> str:
+    raise NotImplementedError("Week 3 Day 7 (Optional): implement speculative_generate")

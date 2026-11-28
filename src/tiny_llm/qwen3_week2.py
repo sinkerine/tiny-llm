@@ -12,8 +12,10 @@ from .kv_cache import TinyKvCache, TinyKvFullCache
 from .quantize import QuantizedWeights, dequantize_linear, quantized_linear  # noqa: F401
 from .quantized_embedding import QuantizedEmbedding
 from .week2_kernels import (
+    DENSE_PREFILL_MIN_QUERY,
     FastRMSNorm,  # noqa: F401 - learner checkpoint dependency
     FastRoPE,  # noqa: F401 - learner checkpoint dependency
+    dense_prefill_attention_mma,
     scaled_dot_product_attention,  # noqa: F401 - learner checkpoint dependency
     swiglu,  # noqa: F401 - learner checkpoint dependency
 )
@@ -129,6 +131,35 @@ class Qwen3MultiHeadAttention:
             if use_fast_rope
             else RoPE(head_dim, max_seq_len, theta)
         )
+        self.use_tiled_prefill_attention = use_tiled_prefill_attention
+        self.attention_dispatch_counts = {
+            "tiled_prefill": 0,
+            "tiled_prefill_fallback": 0,
+            "readable": 0,
+        }
+
+    def _can_use_tiled_prefill(
+        self,
+        q: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        mask: torch.Tensor | str | None,
+    ) -> bool:
+        return (
+            q.shape[2] >= DENSE_PREFILL_MIN_QUERY
+            and self.head_dim == 128
+            and q.is_cuda
+            and keys.is_cuda
+            and values.is_cuda
+            and q.dtype == torch.bfloat16
+            and keys.dtype == torch.bfloat16
+            and values.dtype == torch.bfloat16
+            and (
+                mask is None
+                or mask == "causal"
+                or (isinstance(mask, torch.Tensor) and mask.is_floating_point())
+            )
+        )
 
     def __call__(
         self,
@@ -156,21 +187,33 @@ class Qwen3MultiHeadAttention:
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         keys, values, _, mask = cache.update_and_fetch(k, v, mask=mask)
-        S = keys.shape[2]
-        attention_mask = mask
-        if isinstance(mask, str) and mask == "causal":
-            query_pos = torch.arange(offsets, L + offsets, device=q.device)
-            key_pos = torch.arange(0, S, device=k.device)
-            attention_mask = key_pos[None, :] <= query_pos[:, None]
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q,
-            keys,
-            values,
-            attn_mask=attention_mask,
-            is_causal=False,
-            dropout_p=0.0,
-            enable_gqa=True,
-        )
+        if self.use_tiled_prefill_attention and self._can_use_tiled_prefill(
+            q, keys, values, mask
+        ):
+            self.attention_dispatch_counts["tiled_prefill"] += 1
+            out = dense_prefill_attention_mma(
+                q, keys, values, self.head_dim**-0.5, mask
+            )
+        else:
+            if self.use_tiled_prefill_attention:
+                self.attention_dispatch_counts["tiled_prefill_fallback"] += 1
+            else:
+                self.attention_dispatch_counts["readable"] += 1
+            S = keys.shape[2]
+            attention_mask = mask
+            if isinstance(mask, str) and mask == "causal":
+                query_pos = torch.arange(offsets, L + offsets, device=q.device)
+                key_pos = torch.arange(0, S, device=k.device)
+                attention_mask = key_pos[None, :] <= query_pos[:, None]
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                keys,
+                values,
+                attn_mask=attention_mask,
+                is_causal=False,
+                dropout_p=0.0,
+                enable_gqa=True,
+            )
         out = (
             out.transpose(1, 2)
             .reshape(B, L, self.num_heads * self.head_dim)
@@ -260,6 +303,7 @@ class Qwen3TransformerBlock:
             rms_norm_eps,
             use_fast_rms_norm=use_fast_rms_norm,
             use_fast_rope=use_fast_rope,
+            use_tiled_prefill_attention=use_tiled_prefill_attention,
         )
 
     def __call__(
@@ -323,6 +367,11 @@ class Qwen3ModelWeek2:
         self.norm = norm_cls(
             config.hidden_size, hf_model.model.norm.weight, config.rms_norm_eps
         )
+        tiled_prefill = (
+            features.tiled_prefill_attention
+            if use_tiled_prefill_attention is None
+            else use_tiled_prefill_attention
+        )
         self.layers_inner = []
         for layer in hf_model.model.layers:
             self.layers_inner.append(
@@ -349,6 +398,7 @@ class Qwen3ModelWeek2:
                     use_fast_rms_norm=features.fast_rms_norm,
                     use_fast_rope=features.fast_rope,
                     use_fast_swiglu=features.fast_swiglu,
+                    use_tiled_prefill_attention=tiled_prefill,
                 )
             )
         self.tie_word_embeddings = config.tie_word_embeddings
